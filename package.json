@@ -1,0 +1,13 @@
+{
+  "name": "flare-tanks",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test:smoke": "node scripts/smoke-test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
