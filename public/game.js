@@ -1,4 +1,4 @@
-import { TILE, VISION, makeGrid, isWall, stepTank, visibilityPolygon } from "./shared.js";
+import { TILE, VISION, makeGrid, stepTank, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
 const W = 320, H = 180;
@@ -39,6 +39,20 @@ const mouse = { x: W / 2 + 30, y: H / 2, down: false };
 let lastSentKey = "", lastSentAt = 0;
 const cam = { x: 0, y: 0 };
 
+// ===== 自機の予測処理 =====
+// 入力をすぐ自機に反映し、サーバーの結果で少しずつ補正する
+const PREDICT = {
+  snapDist: 24, // これ以上ずれたら補正せず即座に合わせる（復活・大きなずれ）
+  correct: 0.15, // スナップショット1回ごとに縮めるずれの割合
+  historyMs: 1000, // 予測位置の履歴を残す長さ
+};
+let pred = null; // 予測中の自機 {x, y, body}
+let history = []; // [{t, x, y}] 過去の予測位置
+let seq = 0; // 入力の確認番号
+const sentAt = new Map(); // 確認番号 → 送信時刻
+let rtt = 100; // 入力がサーバーに反映されて戻るまでの時間（ms、平滑化）
+let lastFrameAt = performance.now();
+
 // ===== 開始・接続 =====
 overlay.addEventListener("click", start);
 overlay.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") start(); });
@@ -64,8 +78,10 @@ function connect() {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
       myId = m.id; map = m.map; grid = makeGrid(map); prev = curr = null;
+      pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
       prev = curr; curr = m; currAt = performance.now();
+      reconcile(m);
       m.ev.forEach(playEvent);
     }
   };
@@ -105,16 +121,59 @@ function localAim(me) {
 
 function sendInput(aim) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const mx = (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0);
-  const my = (keys.has("down") ? 1 : 0) - (keys.has("up") ? 1 : 0);
+  const { mx, my } = moveInput();
   const fire = mouse.down;
   // 変化したときだけ、最短50ms間隔で送る（無料枠の節約）
   const key = `${mx},${my},${Math.round(aim * 40)},${fire}`;
   const now = performance.now();
   if (key === lastSentKey || now - lastSentAt < 50) return;
-  ws.send(JSON.stringify({ t: "in", mx, my, aim: Math.round(aim * 1000) / 1000, fire }));
+  seq++;
+  sentAt.set(seq, now);
+  ws.send(JSON.stringify({ t: "in", q: seq, mx, my, aim: Math.round(aim * 1000) / 1000, fire }));
   lastSentKey = key;
   lastSentAt = now;
+}
+
+function moveInput() {
+  return {
+    mx: (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0),
+    my: (keys.has("down") ? 1 : 0) - (keys.has("up") ? 1 : 0),
+  };
+}
+
+// 毎フレーム、現在の入力で自機を先に動かす（壁判定はサーバーと同じ stepTank）
+function predict(dt) {
+  const me = curr && curr.tanks.find((k) => k.id === myId);
+  if (!me || me.dead) { pred = null; history = []; return; }
+  if (!pred) pred = { x: me.x, y: me.y, body: me.b };
+  const { mx, my } = moveInput();
+  stepTank(grid, pred, mx, my, dt);
+  const now = performance.now();
+  history.push({ t: now, x: pred.x, y: pred.y });
+  while (history.length && history[0].t < now - PREDICT.historyMs) history.shift();
+}
+
+// スナップショット受信時：往復遅延ぶん前の予測位置とサーバー位置を比べて補正する
+function reconcile(m) {
+  const now = performance.now();
+  const t = sentAt.get(m.q);
+  if (t !== undefined) {
+    rtt = rtt * 0.8 + (now - t) * 0.2;
+    for (const q of sentAt.keys()) if (q <= m.q) sentAt.delete(q);
+  }
+  const me = m.tanks.find((k) => k.id === myId);
+  if (!pred || !me || me.dead) return;
+  const target = now - rtt;
+  const past = history.find((h) => h.t >= target) || { x: pred.x, y: pred.y };
+  const ex = me.x - past.x, ey = me.y - past.y;
+  if (Math.hypot(ex, ey) > PREDICT.snapDist) {
+    pred = { x: me.x, y: me.y, body: me.b };
+    history = [];
+    return;
+  }
+  const cx = ex * PREDICT.correct, cy = ey * PREDICT.correct;
+  pred.x += cx; pred.y += cy;
+  for (const h of history) { h.x += cx; h.y += cy; }
 }
 
 // ===== 補間 =====
@@ -240,7 +299,11 @@ function frame() {
     requestAnimationFrame(frame);
     return;
   }
-  const tanks = interpolatedTanks();
+  const nowMs = performance.now();
+  predict(Math.min(0.05, (nowMs - lastFrameAt) / 1000));
+  lastFrameAt = nowMs;
+  // 自機は予測位置で描く（スナップショット本体は補正に使うので書き換えない）
+  const tanks = interpolatedTanks().map((k) => (k.id === myId && pred ? { ...k, x: pred.x, y: pred.y, b: pred.body } : k));
   const me = tanks.find((k) => k.id === myId);
   const mapW = map[0].length * TILE, mapH = map.length * TILE;
   if (me) {
@@ -248,6 +311,7 @@ function frame() {
     cam.y = clamp(Math.round(me.y - H / 2), 0, mapH - H);
   }
   const aim = localAim(me);
+  if (me && pred) me.a = aim; // 砲塔もマウスの現在の向きで描く
   sendInput(aim);
   drawMap();
   drawFog(me, aim);

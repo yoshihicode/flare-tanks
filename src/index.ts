@@ -18,6 +18,7 @@ interface Player {
   x: number; y: number; body: number; aim: number;
   hp: number; dead: boolean; respawnAt: number; cooldown: number;
   input: Input;
+  seq: number; // 最後に受け取った入力の確認番号（クライアントの予測補正用に返す）
 }
 interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team }
 // team：その出来事に関わる戦車のチーム（発射した側・被弾した側・弾の持ち主）。同じチームには常に送る
@@ -99,6 +100,7 @@ export class Room extends DurableObject<Env> {
       x: 0, y: 0, body: 0, aim: 0,
       hp: MAX_HP, dead: false, respawnAt: 0, cooldown: 0,
       input: { mx: 0, my: 0, aim: 0, fire: false },
+      seq: 0,
     };
     this.spawn(p);
     this.players.set(id, p);
@@ -137,6 +139,7 @@ export class Room extends DurableObject<Env> {
       aim: Number.isFinite(m.aim) ? m.aim : p.input.aim,
       fire: m.fire === true,
     };
+    if (Number.isInteger(m.q)) p.seq = m.q;
   }
 
   startLoop() {
@@ -216,6 +219,7 @@ export class Room extends DurableObject<Env> {
     const seen = (x: number, y: number) => canSeePoint(GRID, v, x, y);
     return JSON.stringify({
       t: "s",
+      q: v.seq,
       tanks: tanks
         .filter((p) => p.team === v.team || (!p.dead && canSeeTank(GRID, v, p)))
         .map((p) => ({

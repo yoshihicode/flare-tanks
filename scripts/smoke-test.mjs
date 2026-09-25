@@ -19,7 +19,13 @@ function join() {
     };
   });
 }
-const send = (c, m) => c.ws.readyState === 1 && c.ws.send(JSON.stringify({ t: "in", aim: 0, fire: false, ...m }));
+// 入力には確認番号 q を付ける（クライアントの予測補正と同じ形式）
+const send = (c, m) => {
+  if (c.ws.readyState !== 1) return;
+  c.q = (c.q || 0) + 1;
+  c.sentAt = { ...c.sentAt, [c.q]: Date.now() };
+  c.ws.send(JSON.stringify({ t: "in", q: c.q, aim: 0, fire: false, ...m }));
+};
 const view = (k) => ({ x: k.x, y: k.y, aim: k.a });
 
 const a = await join(); // チームA：撃つ側
@@ -59,6 +65,7 @@ const st = {
   enemyOk: 0, enemyNg: 0, // 送られた敵が本当に視界内か
   bulletOk: 0, bulletNg: 0, // Bに送られた（Aの）弾が視界内か
   fireOk: 0, fireNg: 0, // Bに送られた発射イベントが視界内か（自チーム分を除く）
+  lastAck: 0, rtts: [], // サーバーが返した確認番号と、そこから測った往復時間
 };
 const ratioOk = (ok, ng, min) => ok > 0 && ok / (ok + ng) >= min;
 
@@ -69,6 +76,7 @@ let bTurned = false, aPrev = null;
 
 a.onSnap = (m) => {
   const el = Date.now() - t0;
+  if (m.q > st.lastAck) { st.rtts.push(Date.now() - a.sentAt[m.q]); st.lastAck = m.q; }
   const me = m.tanks.find((k) => k.id === a.id);
   const en = m.tanks.find((k) => k.team !== me.team);
   m.tanks.some((k) => k.id === c.id) ? st.allyShown++ : st.allyMissing++;
@@ -106,6 +114,8 @@ setTimeout(() => {
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
     ["移動が共有コードと一致 ≥95%", st.moveSame > 20 && ratioOk(st.moveSame, st.moveDiff, 0.95), `same=${st.moveSame} diff=${st.moveDiff}`],
+    ["入力の確認番号が返る", st.lastAck === a.q && st.lastAck > 1, `ack=${st.lastAck} sent=${a.q}`],
+    ["確認番号の往復 <500ms", st.rtts.length > 0 && Math.max(...st.rtts) < 500, `max=${Math.max(...st.rtts)}ms`],
     ["可視ポリゴンが見通し線と一致 ≥98%", ratioOk(poly.same, poly.diff, 0.98), `same=${poly.same} diff=${poly.diff}`],
     ["味方は常に送られる", st.allyShown > 100 && st.allyMissing === 0, `shown=${st.allyShown} missing=${st.allyMissing}`],
     ["離れている間は敵が送られない", st.earlyLeak === 0, `leak=${st.earlyLeak}`],
