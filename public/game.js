@@ -1,4 +1,4 @@
-"use strict";
+import { TILE, makeGrid, isWall, stepTank } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
 const W = 320, H = 180;
@@ -25,7 +25,7 @@ addEventListener("resize", fit);
 fit();
 
 // ===== 状態 =====
-let ws = null, myId = null, map = [], TILE = 16;
+let ws = null, myId = null, map = [], grid = null;
 let prev = null, curr = null, currAt = 0;
 let audio = null;
 const keys = new Set();
@@ -57,7 +57,7 @@ function connect() {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
-      myId = m.id; map = m.map; TILE = m.tile; prev = curr = null;
+      myId = m.id; map = m.map; grid = makeGrid(map); prev = curr = null;
     } else if (m.t === "s") {
       prev = curr; curr = m; currAt = performance.now();
       m.ev.forEach(playEvent);

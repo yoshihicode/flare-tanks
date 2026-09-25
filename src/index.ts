@@ -1,11 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
+// 移動・壁判定はクライアントの予測処理と同じコードを使う
+import { TILE, TICK_MS, TANK, makeGrid, isWall as isWallAt, stepTank } from "../public/shared.js";
 
 // ===== ゲーム定数（ステップ1の仮の値。戦車3種はステップ3で導入） =====
-const TILE = 16; // 1タイルのピクセル数
-const TICK_MS = 50; // サーバー更新間隔（20Hz）
 const MAX_PLAYERS = 6; // 1部屋の最大人数（3vs3）
-const TANK_R = 6; // 戦車の当たり判定半径（px）
-const SPEED = 60; // 移動速度（px/秒）
 const BULLET_SPEED = 180; // 弾速（px/秒）
 const BULLET_LIFE = 1.5; // 弾の寿命（秒）
 const FIRE_INTERVAL = 0.6; // 連射間隔（秒）
@@ -30,6 +28,7 @@ interface Env { ROOM: DurableObjectNamespace }
 const MAP = buildMap();
 const MAP_W = MAP[0].length;
 const MAP_H = MAP.length;
+const GRID = makeGrid(MAP);
 
 function buildMap(): string[] {
   const W = 40, H = 24;
@@ -49,15 +48,7 @@ function buildMap(): string[] {
   return g.map((r) => r.join(""));
 }
 
-function isWall(px: number, py: number): boolean {
-  const tx = Math.floor(px / TILE), ty = Math.floor(py / TILE);
-  if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return true;
-  return MAP[ty][tx] === "#";
-}
-
-function hitsWall(x: number, y: number, r: number): boolean {
-  return isWall(x - r, y - r) || isWall(x + r, y - r) || isWall(x - r, y + r) || isWall(x + r, y + r);
-}
+const isWall = (px: number, py: number): boolean => isWallAt(GRID, px, py);
 
 function spawnPoint(team: Team, i: number) {
   const tx = 3, ty = 10 + i * 2;
@@ -157,11 +148,6 @@ export class Room extends DurableObject<Env> {
     this.bullets = [];
   }
 
-  moveTank(p: Player, dx: number, dy: number) {
-    if (!hitsWall(p.x + dx, p.y, TANK_R)) p.x += dx;
-    if (!hitsWall(p.x, p.y + dy, TANK_R)) p.y += dy;
-  }
-
   tick() {
     const now = Date.now() / 1000;
     const dt = TICK_MS / 1000;
@@ -172,12 +158,7 @@ export class Room extends DurableObject<Env> {
         if (now >= p.respawnAt) this.spawn(p);
         continue;
       }
-      const { mx, my } = p.input;
-      const len = Math.hypot(mx, my);
-      if (len > 0) {
-        this.moveTank(p, (mx / len) * SPEED * dt, (my / len) * SPEED * dt);
-        p.body = Math.atan2(my, mx);
-      }
+      stepTank(GRID, p, p.input.mx, p.input.my, dt);
       p.aim = p.input.aim;
       p.cooldown = Math.max(0, p.cooldown - dt);
       if (p.input.fire && p.cooldown === 0) {
@@ -204,7 +185,7 @@ export class Room extends DurableObject<Env> {
       }
       for (const p of this.players.values()) {
         if (p.dead || p.team === b.team) continue;
-        if (Math.hypot(p.x - b.x, p.y - b.y) < TANK_R + 2) {
+        if (Math.hypot(p.x - b.x, p.y - b.y) < TANK.r + 2) {
           p.hp -= DAMAGE;
           if (p.hp <= 0) {
             p.hp = 0;

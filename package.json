@@ -1,6 +1,7 @@
 {
   "name": "flare-tanks",
   "private": true,
+  "type": "module",
   "version": "0.1.0",
   "scripts": {
     "dev": "wrangler dev",
