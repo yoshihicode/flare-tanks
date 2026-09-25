@@ -18,11 +18,9 @@
       background: var(--night); color: var(--ash);
       font-family: "DotGothic16", "MS Gothic", monospace;
     }
-    #c {
-      position: absolute; inset: 0; margin: auto;
-      image-rendering: pixelated; background: #000;
-      cursor: crosshair;
-    }
+    #c, #hud { position: absolute; inset: 0; margin: auto; }
+    #c { image-rendering: pixelated; background: #000; cursor: crosshair; }
+    #hud { pointer-events: none; } /* 文字だけを高解像度で重ねる。操作はその下の #c が受ける */
     #overlay {
       position: absolute; inset: 0;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -54,6 +52,7 @@
 </head>
 <body>
   <canvas id="c" width="320" height="180"></canvas>
+  <canvas id="hud" aria-hidden="true"></canvas>
   <div id="overlay" role="button" tabindex="0">
     <h1>FLARE TANKS</h1>
     <div id="tanks" role="group" aria-label="戦車の選択"></div>

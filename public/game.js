@@ -17,10 +17,21 @@ const PALETTE = {
   fog: "rgba(4, 7, 5, 0.78)", // 視界の外を覆う暗さ
 };
 
+// 文字（HUD）だけは画面の実際の解像度で描く重ねキャンバス。
+// 320×180 に 8px の文字を描いて拡大すると漢字がつぶれるため。座標は 320×180 のまま使えるよう拡大率を掛けておく
+const hudCv = document.getElementById("hud");
+const hud = hudCv.getContext("2d");
+
 function fit() {
   const s = Math.max(1, Math.floor(Math.min(innerWidth / W, innerHeight / H)));
-  cv.style.width = W * s + "px";
-  cv.style.height = H * s + "px";
+  const k = s * (window.devicePixelRatio || 1);
+  for (const c of [cv, hudCv]) {
+    c.style.width = W * s + "px";
+    c.style.height = H * s + "px";
+  }
+  hudCv.width = Math.round(W * k);
+  hudCv.height = Math.round(H * k);
+  hud.setTransform(k, 0, 0, k, 0, 0);
 }
 addEventListener("resize", fit);
 fit();
@@ -324,41 +335,41 @@ const resultText = (r) => (r === "draw" ? "引き分け" : r === curr.team ? "�
 // 案内の帯。cy は帯の中心の高さ（既定は画面中央）
 function banner(lines, big = false, cy = H / 2) {
   const h = big ? 28 : 12 * lines.length + 8;
-  ctx.fillStyle = "rgba(0,0,0,0.6)";
-  ctx.fillRect(0, cy - h / 2, W, h);
-  ctx.textAlign = "center";
-  ctx.fillStyle = PALETTE.flare;
+  hud.fillStyle = "rgba(0,0,0,0.6)";
+  hud.fillRect(0, cy - h / 2, W, h);
+  hud.textAlign = "center";
+  hud.fillStyle = PALETTE.flare;
   if (big) {
-    ctx.font = "16px DotGothic16, monospace";
-    ctx.fillText(lines[0], W / 2, cy - 8);
-    ctx.font = "8px DotGothic16, monospace";
+    hud.font = "16px DotGothic16, monospace";
+    hud.fillText(lines[0], W / 2, cy - 8);
+    hud.font = "8px DotGothic16, monospace";
   } else {
-    lines.forEach((t, i) => ctx.fillText(t, W / 2, cy - h / 2 + 5 + i * 12));
+    lines.forEach((t, i) => hud.fillText(t, W / 2, cy - h / 2 + 5 + i * 12));
   }
-  ctx.textAlign = "left";
+  hud.textAlign = "left";
 }
 
 function drawHud(me) {
   const g = curr.g;
-  ctx.font = "8px DotGothic16, monospace";
-  ctx.textBaseline = "top";
-  ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(0, 0, W, 12);
+  hud.font = "8px DotGothic16, monospace";
+  hud.textBaseline = "top";
+  hud.fillStyle = "rgba(0,0,0,0.5)"; hud.fillRect(0, 0, W, 12);
   // 左：ラウンド、各チームの勝ち数（●）と生存数
   const marks = (n) => "●".repeat(n) + "○".repeat(Math.max(0, g.wr - n));
-  ctx.fillStyle = "#c9c4b3"; ctx.fillText(`R${g.r}`, 4, 2);
-  ctx.fillStyle = PALETTE.A; ctx.fillText(`A ${marks(g.w[0])} ${g.al[0]}機`, 22, 2);
-  ctx.fillStyle = PALETTE.B; ctx.fillText(`B ${marks(g.w[1])} ${g.al[1]}機`, 82, 2);
+  hud.fillStyle = "#c9c4b3"; hud.fillText(`R${g.r}`, 4, 2);
+  hud.fillStyle = PALETTE.A; hud.fillText(`A ${marks(g.w[0])} ${g.al[0]}機`, 22, 2);
+  hud.fillStyle = PALETTE.B; hud.fillText(`B ${marks(g.w[1])} ${g.al[1]}機`, 82, 2);
   // 中央：残り時間
-  ctx.textAlign = "center";
-  ctx.fillStyle = "#c9c4b3";
-  if (g.ph === "play") ctx.fillText(fmtTime(g.t), W / 2 + 20, 2);
+  hud.textAlign = "center";
+  hud.fillStyle = "#c9c4b3";
+  if (g.ph === "play") hud.fillText(fmtTime(g.t), W / 2 + 20, 2);
   // 右：自分の車種とHP
-  ctx.textAlign = "right";
+  hud.textAlign = "right";
   if (me) {
-    ctx.fillStyle = PALETTE.flare;
-    ctx.fillText(`${tankSpec(me.k).name}  HP ${me.hp}`, W - 4, 2);
+    hud.fillStyle = PALETTE.flare;
+    hud.fillText(`${tankSpec(me.k).name}  HP ${me.hp}`, W - 4, 2);
   }
-  ctx.textAlign = "left";
+  hud.textAlign = "left";
 
   if (g.ph === "wait") {
     banner([
@@ -376,16 +387,17 @@ function drawHud(me) {
   const note = !me ? "観戦中：次のラウンドから参加します（味方の視点のみ）"
     : me.dead && g.ph === "play" ? "撃破されました　味方の視点で観戦中" : "";
   if (note) {
-    ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(0, H - 14, W, 14);
-    ctx.fillStyle = PALETTE.flare; ctx.textAlign = "center";
-    ctx.fillText(note, W / 2, H - 11);
-    ctx.textAlign = "left";
+    hud.fillStyle = "rgba(0,0,0,0.5)"; hud.fillRect(0, H - 14, W, 14);
+    hud.fillStyle = PALETTE.flare; hud.textAlign = "center";
+    hud.fillText(note, W / 2, H - 11);
+    hud.textAlign = "left";
   }
 }
 
 function frame() {
   ctx.fillStyle = "#000";
   ctx.fillRect(0, 0, W, H);
+  hud.clearRect(0, 0, W, H);
   if (!curr || !map.length) {
     requestAnimationFrame(frame);
     return;
