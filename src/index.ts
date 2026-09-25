@@ -4,7 +4,7 @@ import {
   TILE, TICK_MS, TANK_TYPES, DEFAULT_TANK, tankSpec, makeGrid, isWall as isWallAt,
   stepTank, turnTurret, canSeePoint, canSeeTank,
 } from "../public/shared.js";
-import { Bot } from "./bot.ts";
+import { Bot, type TeamIntel } from "./bot.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
 const TEAM_SIZE = 3; // 1チームの台数（3vs3）。空いた枠は bot が埋める
@@ -30,6 +30,7 @@ interface Tank {
   input: Input;
   human: string | null; // 操作している接続のID
   bot: Bot | null;
+  hit: { dir: number; at: number } | null; // 最後に撃たれた方向（bot が振り向くのに使う）
 }
 // 人間の接続
 interface Client {
@@ -108,6 +109,7 @@ export class Room extends DurableObject<Env> {
   events: GameEvent[] = [];
   timer: ReturnType<typeof setInterval> | null = null;
   botLevel = BOT_LEVEL_DEFAULT;
+  intel: Record<Team, { last: TeamIntel | null }> = { A: { last: null }, B: { last: null } }; // bot の発見情報（レベル5）
   debug = { freezeBots: false };
 
   async fetch(req: Request): Promise<Response> {
@@ -142,17 +144,25 @@ export class Room extends DurableObject<Env> {
     this.debug = { freezeBots: false };
     this.bullets = [];
     this.tanks = [];
+    this.intel = { A: { last: null }, B: { last: null } };
     for (const team of TEAMS) {
       for (let slot = 0; slot < TEAM_SIZE; slot++) {
         const t: Tank = {
           id: `${team}${slot}`, team, slot, type: BOT_TYPES[slot],
           x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, respawnAt: 0, cooldown: 0,
-          input: { ...IDLE }, human: null, bot: new Bot(this.botLevel, GRID),
+          input: { ...IDLE }, human: null, bot: null, hit: null,
         };
+        t.bot = this.newBot(t);
         this.spawn(t);
         this.tanks.push(t);
       }
     }
+  }
+
+  newBot(t: Tank): Bot {
+    const home = spawnPoint(t.team, 1);
+    const enemyHome = spawnPoint(t.team === "A" ? "B" : "A", 1);
+    return new Bot(this.botLevel, GRID, { home, enemyHome, intel: this.intel[t.team], bulletSpeed: BULLET_SPEED });
   }
 
   // 人間の少ないチームへ入れる（同数ならA）
@@ -181,7 +191,7 @@ export class Room extends DurableObject<Env> {
     if (!this.clients.delete(c.id)) return;
     if (c.tank) {
       c.tank.human = null;
-      c.tank.bot = new Bot(this.botLevel, GRID);
+      c.tank.bot = this.newBot(c.tank);
       c.tank.input = { ...IDLE, aim: c.tank.aim };
     }
     if (this.clients.size === 0) this.stopLoop();
@@ -189,7 +199,7 @@ export class Room extends DurableObject<Env> {
 
   spawn(t: Tank) {
     const s = spawnPoint(t.team, t.slot);
-    Object.assign(t, { x: s.x, y: s.y, body: s.body, aim: s.body, hp: tankSpec(t.type).hp, dead: false, cooldown: 0 });
+    Object.assign(t, { x: s.x, y: s.y, body: s.body, aim: s.body, hp: tankSpec(t.type).hp, dead: false, cooldown: 0, hit: null });
   }
 
   onMessage(c: Client, data: unknown) {
@@ -230,7 +240,7 @@ export class Room extends DurableObject<Env> {
       if (this.debug.freezeBots) { t.input = { ...IDLE, aim: t.aim }; continue; }
       const enemies = this.tanks.filter((e) => e.team !== t.team && !e.dead && canSeeTank(GRID, t, e));
       const allies = this.tanks.filter((a) => a.team === t.team && a !== t);
-      t.input = t.bot.think({ self: t, allies, enemies, now });
+      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now });
     }
   }
 
@@ -276,6 +286,7 @@ export class Room extends DurableObject<Env> {
         if (t.dead || t.team === b.team) continue;
         if (Math.hypot(t.x - b.x, t.y - b.y) < tankSpec(t.type).r + 2) {
           t.hp = Math.max(0, t.hp - b.damage);
+          t.hit = { dir: Math.atan2(-b.vy, -b.vx), at: now };
           if (t.hp === 0) {
             t.dead = true;
             t.respawnAt = now + RESPAWN_SEC;

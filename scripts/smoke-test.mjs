@@ -5,6 +5,7 @@
 import {
   makeGrid, stepTank, canSeePoint, canSeeTank, lineOfSight, visibilityPolygon, isWall, angleDiff, tankSpec, TICK_MS, TILE,
 } from "../public/shared.js";
+import { botChecks } from "./bot-checks.mjs";
 
 const BASE = process.env.WS_URL || "ws://localhost:8787/ws";
 const room = "smoke-" + Date.now();
@@ -13,9 +14,9 @@ let grid = null;
 
 // 参加して最初のスナップショットを受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
 // c.id は自分が操作している戦車のID（bot の枠を引き継ぐので、スナップショットの me で知る）
-function join(tank, roomName = room) {
+function join(tank, roomName = room, extra = "") {
   return new Promise((resolve, reject) => {
-    const c = { ws: new WebSocket(`${BASE}?room=${roomName}&tank=${tank}`), id: null, onSnap: null };
+    const c = { ws: new WebSocket(`${BASE}?room=${roomName}&tank=${tank}${extra}`), id: null, onSnap: null };
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
@@ -44,16 +45,17 @@ const c = await join("light"); // チームA：少し下へ動いて待機（味
 const t0 = Date.now();
 
 // ===== 別の部屋：bot の巡回と、切断した戦車の引き継ぎ =====
-const bots = { moved: 0, takenOver: false, alliesMax: 0 };
+const bots = { moved: 0, takenOver: false, alliesMax: 0, fires: 0 };
 (async () => {
   const room2 = room + "-bots";
-  const x = await join("medium", room2); // A
+  const x = await join("medium", room2, "&bot=5"); // A。最初の人が bot の強さを決める
   await join("medium", room2); // B
   const z = await join("heavy", room2); // A。1秒後に切断する
   const start = new Map();
   x.onSnap = (m) => {
     const team = m.tanks.filter((k) => k.team === "A");
     bots.alliesMax = Math.max(bots.alliesMax, team.length);
+    bots.fires += m.ev.filter((e) => e.e === "fire").length; // x は撃たないので、味方 bot か見えた敵 bot の発射
     for (const k of team) {
       if (!k.bot) continue;
       if (!start.has(k.id)) start.set(k.id, k);
@@ -162,6 +164,8 @@ setTimeout(() => {
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
     ["両チームとも3台（空き枠は bot）", st.teamA === 3 && st.teamB === 3, `A=${st.teamA} B=${st.teamB}`],
     ["bot が巡回で動く", bots.moved > 0, `moved=${bots.moved}`],
+    ["bot が敵を見つけて撃つ（Lv5の部屋）", bots.fires > 0, `fire=${bots.fires}`],
+    ...botChecks(),
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
     ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,
