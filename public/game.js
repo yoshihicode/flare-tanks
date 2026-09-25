@@ -1,4 +1,4 @@
-import { TILE, makeGrid, isWall, stepTank } from "./shared.js";
+import { TILE, VISION, makeGrid, isWall, stepTank, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
 const W = 320, H = 180;
@@ -14,6 +14,7 @@ const PALETTE = {
   A: "#5ad1c8", B: "#e8506a",
   bullet: "#ffe08a", flare: "#ffb347",
   hpBack: "#3a1d1d", hpFore: "#7bd66b",
+  fog: "rgba(4, 7, 5, 0.78)", // 視界の外を覆う暗さ
 };
 
 function fit() {
@@ -23,6 +24,11 @@ function fit() {
 }
 addEventListener("resize", fit);
 fit();
+
+// 視界の外を暗くするための重ね塗り用キャンバス
+const fogCv = document.createElement("canvas");
+fogCv.width = W; fogCv.height = H;
+const fog = fogCv.getContext("2d");
 
 // ===== 状態 =====
 let ws = null, myId = null, map = [], grid = null;
@@ -92,12 +98,15 @@ addEventListener("mouseup", (e) => { if (e.button === 0) mouse.down = false; });
 addEventListener("contextmenu", (e) => e.preventDefault());
 addEventListener("blur", () => { keys.clear(); mouse.down = false; });
 
-function sendInput(me) {
+// 自機から見たマウスの方向（砲塔・視界の向き）
+function localAim(me) {
+  return me ? Math.atan2(mouse.y - (me.y - cam.y), mouse.x - (me.x - cam.x)) : 0;
+}
+
+function sendInput(aim) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const mx = (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0);
   const my = (keys.has("down") ? 1 : 0) - (keys.has("up") ? 1 : 0);
-  let aim = 0;
-  if (me) aim = Math.atan2(mouse.y - (me.y - cam.y), mouse.x - (me.x - cam.x));
   const fire = mouse.down;
   // 変化したときだけ、最短50ms間隔で送る（無料枠の節約）
   const key = `${mx},${my},${Math.round(aim * 40)},${fire}`;
@@ -175,6 +184,35 @@ function drawTank(k, isMe) {
   ctx.fillRect(x - 6, y - 10, Math.round((12 * k.hp) / 100), 2);
 }
 
+// 可視ポリゴン ∩（扇形 ∪ 全周の円）の外側を暗くする。
+// 判定はサーバーと同じ形だが、向きはマウスの現在値を使うので、サーバーより少し先に明るくなる
+function drawFog(me, aim) {
+  fog.globalCompositeOperation = "source-over";
+  fog.clearRect(0, 0, W, H);
+  fog.fillStyle = PALETTE.fog;
+  fog.fillRect(0, 0, W, H);
+  if (!me) return ctx.drawImage(fogCv, 0, 0);
+  const x = me.x - cam.x, y = me.y - cam.y;
+  const pts = visibilityPolygon(grid, me.x, me.y, VISION.range);
+  fog.save();
+  fog.beginPath();
+  pts.forEach(([px, py], i) => (i ? fog.lineTo(px - cam.x, py - cam.y) : fog.moveTo(px - cam.x, py - cam.y)));
+  fog.closePath();
+  fog.clip();
+  fog.globalCompositeOperation = "destination-out";
+  fog.fillStyle = "#000";
+  fog.beginPath();
+  fog.moveTo(x, y);
+  fog.arc(x, y, VISION.range, aim - VISION.fov / 2, aim + VISION.fov / 2);
+  fog.closePath();
+  fog.fill();
+  fog.beginPath();
+  fog.arc(x, y, VISION.near, 0, Math.PI * 2);
+  fog.fill();
+  fog.restore();
+  ctx.drawImage(fogCv, 0, 0);
+}
+
 function drawHud(me) {
   ctx.font = "8px DotGothic16, monospace";
   ctx.textBaseline = "top";
@@ -209,8 +247,10 @@ function frame() {
     cam.x = clamp(Math.round(me.x - W / 2), 0, mapW - W);
     cam.y = clamp(Math.round(me.y - H / 2), 0, mapH - H);
   }
-  sendInput(me);
+  const aim = localAim(me);
+  sendInput(aim);
   drawMap();
+  drawFog(me, aim);
   ctx.fillStyle = PALETTE.bullet;
   for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);

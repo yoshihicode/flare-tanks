@@ -88,3 +88,68 @@ export function canSeeTank(g, v, t) {
   const px = (-(t.y - v.y) / d) * TANK.r, py = ((t.x - v.x) / d) * TANK.r;
   return canSeePoint(g, v, t.x + px, t.y + py) || canSeePoint(g, v, t.x - px, t.y - py);
 }
+
+// ===== 可視ポリゴン（クライアントの描画用。サーバーは作らない） =====
+// 視点の周囲 range の正方形内にある「壁と床の境目」を、同じ直線上でつないだ線分にする
+function wallEdges(g, x, y, range) {
+  const tx0 = Math.floor((x - range) / TILE), tx1 = Math.floor((x + range) / TILE);
+  const ty0 = Math.floor((y - range) / TILE), ty1 = Math.floor((y + range) / TILE);
+  const segs = []; // [x1, y1, x2, y2]（水平か垂直のみ）
+  const border = (a, b) => isWallTile(g, a[0], a[1]) !== isWallTile(g, b[0], b[1]);
+  for (let ty = ty0; ty <= ty1 + 1; ty++) { // 水平な境目：y = ty*TILE の線
+    let run = -1;
+    for (let tx = tx0; tx <= tx1 + 1; tx++) {
+      const on = tx <= tx1 && border([tx, ty - 1], [tx, ty]);
+      if (on && run < 0) run = tx;
+      if (!on && run >= 0) { segs.push([run * TILE, ty * TILE, tx * TILE, ty * TILE]); run = -1; }
+    }
+  }
+  for (let tx = tx0; tx <= tx1 + 1; tx++) { // 垂直な境目：x = tx*TILE の線
+    let run = -1;
+    for (let ty = ty0; ty <= ty1 + 1; ty++) {
+      const on = ty <= ty1 && border([tx - 1, ty], [tx, ty]);
+      if (on && run < 0) run = ty;
+      if (!on && run >= 0) { segs.push([tx * TILE, run * TILE, tx * TILE, ty * TILE]); run = -1; }
+    }
+  }
+  // 視界の外枠（レイが必ずどこかで止まるように）
+  const L = x - range, R = x + range, T = y - range, B = y + range;
+  segs.push([L, T, R, T], [L, B, R, B], [L, T, L, B], [R, T, R, B]);
+  return segs;
+}
+
+// 視点 (x, y) から見える範囲の多角形を返す（[[x, y], ...]、角度順）。
+// 線分の端点（壁の角）へ、少し左右にずらしたレイも含めて飛ばし、最も近い交点をつなぐ
+export function visibilityPolygon(g, x, y, range) {
+  const segs = wallEdges(g, x, y, range);
+  const angles = [];
+  for (const [x1, y1, x2, y2] of segs) {
+    for (const [px, py] of [[x1, y1], [x2, y2]]) {
+      const a = Math.atan2(py - y, px - x);
+      angles.push(a - 1e-4, a, a + 1e-4);
+    }
+  }
+  angles.sort((p, q) => p - q);
+  const pts = [];
+  for (const a of angles) {
+    const dx = Math.cos(a), dy = Math.sin(a);
+    let best = Infinity;
+    for (const [x1, y1, x2, y2] of segs) {
+      let t;
+      if (y1 === y2) { // 水平線
+        if (dy === 0) continue;
+        t = (y1 - y) / dy;
+        const hx = x + dx * t;
+        if (t <= 0 || hx < Math.min(x1, x2) || hx > Math.max(x1, x2)) continue;
+      } else { // 垂直線
+        if (dx === 0) continue;
+        t = (x1 - x) / dx;
+        const hy = y + dy * t;
+        if (t <= 0 || hy < Math.min(y1, y2) || hy > Math.max(y1, y2)) continue;
+      }
+      if (t < best) best = t;
+    }
+    if (best < Infinity) pts.push([x + dx * best, y + dy * best]);
+  }
+  return pts;
+}
