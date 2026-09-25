@@ -103,10 +103,11 @@ function connect() {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
-      myId = m.id; map = m.map; grid = makeGrid(map); prev = curr = null;
+      myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
       pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
       prev = curr; curr = m; currAt = performance.now();
+      myId = m.me; // 自分が操作している戦車（bot の枠を引き継ぐので接続IDとは別）
       reconcile(m);
       m.ev.forEach(playEvent);
     }

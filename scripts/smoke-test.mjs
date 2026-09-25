@@ -1,4 +1,6 @@
-// 動作確認用：3クライアント（A・B・Aの順に参加）で接続し、撃ち合いと視界の絞り込みを確認する
+// 動作確認用：3クライアント（A・B・Aの順に参加）で接続し、撃ち合いと視界の絞り込みを確認する。
+// 空いた枠は bot が埋めるので、このシナリオではデバッグ用コマンドで bot を止めておく。
+// 別の部屋で bot の巡回と、切断した戦車を bot が引き継ぐことも並行して確認する
 // 使い方：別ターミナルで `npm run dev` を起動してから `npm run test:smoke`
 import {
   makeGrid, stepTank, canSeePoint, canSeeTank, lineOfSight, visibilityPolygon, isWall, angleDiff, tankSpec, TICK_MS, TILE,
@@ -9,18 +11,23 @@ const room = "smoke-" + Date.now();
 const DURATION = 20000;
 let grid = null;
 
-// 参加して init を受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
-function join(tank) {
+// 参加して最初のスナップショットを受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
+// c.id は自分が操作している戦車のID（bot の枠を引き継ぐので、スナップショットの me で知る）
+function join(tank, roomName = room) {
   return new Promise((resolve, reject) => {
-    const c = { ws: new WebSocket(`${BASE}?room=${room}&tank=${tank}`), id: null, onSnap: null };
+    const c = { ws: new WebSocket(`${BASE}?room=${roomName}&tank=${tank}`), id: null, onSnap: null };
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.t === "init") { c.id = m.id; grid ??= makeGrid(m.map); resolve(c); }
-      else if (m.t === "s" && c.onSnap) c.onSnap(m);
+      if (m.t === "init") grid ??= makeGrid(m.map);
+      else if (m.t === "s") {
+        if (!c.id) { c.id = m.me; resolve(c); }
+        if (c.onSnap) c.onSnap(m);
+      }
     };
   });
 }
+const debug = (c, m) => c.ws.send(JSON.stringify({ t: "dbg", ...m }));
 // 入力には確認番号 q を付ける（クライアントの予測補正と同じ形式）
 const send = (c, m) => {
   if (c.ws.readyState !== 1) return;
@@ -31,9 +38,32 @@ const send = (c, m) => {
 const view = (k) => ({ x: k.x, y: k.y, aim: k.a, type: k.k });
 
 const a = await join("medium"); // チームA：撃つ側
+debug(a, { freezeBots: true });
 const b = await join("medium"); // チームB：近づいて撃たれる側
 const c = await join("light"); // チームA：少し下へ動いて待機（味方表示・軽戦車の確認用）
 const t0 = Date.now();
+
+// ===== 別の部屋：bot の巡回と、切断した戦車の引き継ぎ =====
+const bots = { moved: 0, takenOver: false, alliesMax: 0 };
+(async () => {
+  const room2 = room + "-bots";
+  const x = await join("medium", room2); // A
+  await join("medium", room2); // B
+  const z = await join("heavy", room2); // A。1秒後に切断する
+  const start = new Map();
+  x.onSnap = (m) => {
+    const team = m.tanks.filter((k) => k.team === "A");
+    bots.alliesMax = Math.max(bots.alliesMax, team.length);
+    for (const k of team) {
+      if (!k.bot) continue;
+      if (!start.has(k.id)) start.set(k.id, k);
+      const s0 = start.get(k.id);
+      if (k.id !== z.id && Math.hypot(k.x - s0.x, k.y - s0.y) > 24) bots.moved++;
+      if (k.id === z.id && k.k === "heavy") bots.takenOver = true;
+    }
+  };
+  setTimeout(() => z.ws.close(), 1000);
+})();
 
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
 function inPolygon(pts, x, y) {
@@ -94,6 +124,7 @@ a.onSnap = (m) => {
   if (m.q > st.lastAck) { st.rtts.push(Date.now() - a.sentAt[m.q]); st.lastAck = m.q; }
   const me = m.tanks.find((k) => k.id === a.id);
   const en = m.tanks.find((k) => k.team !== me.team);
+  st.teamA = Math.max(st.teamA || 0, m.tanks.filter((k) => k.team === me.team).length);
   const ally = m.tanks.find((k) => k.id === c.id);
   ally ? st.allyShown++ : st.allyMissing++;
   if (el < 400) for (const k of m.tanks) k.hp === tankSpec(k.k).hp ? st.hpOk++ : st.hpNg++;
@@ -108,14 +139,16 @@ a.onSnap = (m) => {
   aPrev = me; cPrev = ally;
 
   if (el < 4000) return;
-  if (en) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(en.y - me.y, en.x - me.x) * 100) / 100, fire: true });
+  const target = m.tanks.find((k) => k.id === b.id);
+  if (target) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(target.y - me.y, target.x - me.x) * 100) / 100, fire: true });
 };
 
 b.onSnap = (m) => {
   snaps++;
   m.ev.forEach((x) => events.add(x.e));
   const me = m.tanks.find((k) => k.id === b.id);
-  // Bに味方はいないので、届く弾はすべてAの弾。視界内のものだけのはず
+  st.teamB = Math.max(st.teamB || 0, m.tanks.filter((k) => k.team === me.team).length);
+  // Bの味方は止めた bot だけなので、届く弾はすべてAの弾。視界内のものだけのはず
   for (const [x, y] of m.bullets) canSeePoint(grid, view(me), x, y) ? st.bulletOk++ : st.bulletNg++;
   for (const e of m.ev) {
     if (e.e === "fire") canSeePoint(grid, view(me), e.x, e.y) ? st.fireOk++ : st.fireNg++;
@@ -127,6 +160,9 @@ setTimeout(() => {
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
+    ["両チームとも3台（空き枠は bot）", st.teamA === 3 && st.teamB === 3, `A=${st.teamA} B=${st.teamB}`],
+    ["bot が巡回で動く", bots.moved > 0, `moved=${bots.moved}`],
+    ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
     ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,
       `max=${st.turnMax.toFixed(3)}rad/tick`],
