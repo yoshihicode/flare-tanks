@@ -106,8 +106,9 @@ function connect() {
       myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
       pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
+      if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
       prev = curr; curr = m; currAt = performance.now();
-      myId = m.me; // 自分が操作している戦車（bot の枠を引き継ぐので接続IDとは別）
+      myId = m.me; // 自分が操作している戦車（bot の枠を引き継ぐので接続IDとは別。観戦中は null）
       reconcile(m);
       m.ev.forEach(playEvent);
     }
@@ -125,6 +126,10 @@ const KEYMAP = {
 };
 addEventListener("keydown", (e) => {
   if (KEYMAP[e.code]) { keys.add(KEYMAP[e.code]); e.preventDefault(); }
+  // 部屋主は待機中に Enter ですぐ開始できる
+  if (e.code === "Enter" && overlay.style.display === "none" && curr && curr.g.ph === "wait" && curr.g.owner) {
+    ws?.send(JSON.stringify({ t: "start" }));
+  }
   if (e.code === "Space") { mouse.down = true; e.preventDefault(); }
 });
 addEventListener("keyup", (e) => {
@@ -171,7 +176,9 @@ function moveInput() {
 // 毎フレーム、現在の入力で自機を先に動かす（壁判定はサーバーと同じ stepTank）
 function predict(dt) {
   const me = curr && curr.tanks.find((k) => k.id === myId);
-  if (!me || me.dead) { pred = null; history = []; return; }
+  // サーバーが動かさない段階（カウントダウン・結果表示）では予測しない
+  const canMove = curr && (curr.g.ph === "wait" || curr.g.ph === "play");
+  if (!me || me.dead || !canMove) { pred = null; history = []; return; }
   if (!pred) pred = { x: me.x, y: me.y, body: me.b, aim: me.a, type: me.k };
   const { mx, my } = moveInput();
   stepTank(grid, pred, mx, my, dt);
@@ -309,25 +316,70 @@ function drawFog(me, aim) {
   ctx.drawImage(fogCv, 0, 0);
 }
 
+const TEAM_NAME = { A: "Aチーム", B: "Bチーム" };
+const fmtTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+// 自分のチームから見た結果
+const resultText = (r) => (r === "draw" ? "引き分け" : r === curr.team ? "勝利" : "敗北");
+
+// 案内の帯。cy は帯の中心の高さ（既定は画面中央）
+function banner(lines, big = false, cy = H / 2) {
+  const h = big ? 28 : 12 * lines.length + 8;
+  ctx.fillStyle = "rgba(0,0,0,0.6)";
+  ctx.fillRect(0, cy - h / 2, W, h);
+  ctx.textAlign = "center";
+  ctx.fillStyle = PALETTE.flare;
+  if (big) {
+    ctx.font = "16px DotGothic16, monospace";
+    ctx.fillText(lines[0], W / 2, cy - 8);
+    ctx.font = "8px DotGothic16, monospace";
+  } else {
+    lines.forEach((t, i) => ctx.fillText(t, W / 2, cy - h / 2 + 5 + i * 12));
+  }
+  ctx.textAlign = "left";
+}
+
 function drawHud(me) {
+  const g = curr.g;
   ctx.font = "8px DotGothic16, monospace";
   ctx.textBaseline = "top";
-  const a = curr.tanks.filter((k) => k.team === "A").length;
-  const b = curr.tanks.length - a;
   ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(0, 0, W, 12);
-  ctx.fillStyle = PALETTE.A; ctx.fillText(`A ${a}`, 4, 2);
-  ctx.fillStyle = PALETTE.B; ctx.fillText(`B ${b}`, 30, 2);
+  // 左：ラウンド、各チームの勝ち数（●）と生存数
+  const marks = (n) => "●".repeat(n) + "○".repeat(Math.max(0, g.wr - n));
+  ctx.fillStyle = "#c9c4b3"; ctx.fillText(`R${g.r}`, 4, 2);
+  ctx.fillStyle = PALETTE.A; ctx.fillText(`A ${marks(g.w[0])} ${g.al[0]}機`, 22, 2);
+  ctx.fillStyle = PALETTE.B; ctx.fillText(`B ${marks(g.w[1])} ${g.al[1]}機`, 82, 2);
+  // 中央：残り時間
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#c9c4b3";
+  if (g.ph === "play") ctx.fillText(fmtTime(g.t), W / 2 + 20, 2);
+  // 右：自分の車種とHP
+  ctx.textAlign = "right";
   if (me) {
     ctx.fillStyle = PALETTE.flare;
-    ctx.textAlign = "right";
     ctx.fillText(`${tankSpec(me.k).name}  HP ${me.hp}`, W - 4, 2);
+  }
+  ctx.textAlign = "left";
+
+  if (g.ph === "wait") {
+    banner([
+      `待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
+      g.owner ? "Enter キーで今すぐ開始　／　ウォームアップ中は撃てません" : "部屋主の開始を待っています　／　ウォームアップ中は撃てません",
+    ], false, H - 20); // 自機に重ならないよう画面下に出す
+  } else if (g.ph === "countdown") {
+    banner([String(g.t)], true);
+  } else if (g.ph === "roundEnd") {
+    banner([`ラウンド${g.r}　${resultText(g.rr)}`, g.rr === "draw" ? "" : `${TEAM_NAME[g.rr]}の勝ち`]);
+  } else if (g.ph === "matchEnd") {
+    banner([`試合終了　${resultText(g.mr)}`, `A ${g.w[0]} - ${g.w[1]} B　まもなく次の試合の待機に戻ります`]);
+  }
+  // 観戦の案内（画面下）
+  const note = !me ? "観戦中：次のラウンドから参加します（味方の視点のみ）"
+    : me.dead && g.ph === "play" ? "撃破されました　味方の視点で観戦中" : "";
+  if (note) {
+    ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(0, H - 14, W, 14);
+    ctx.fillStyle = PALETTE.flare; ctx.textAlign = "center";
+    ctx.fillText(note, W / 2, H - 11);
     ctx.textAlign = "left";
-    if (me.dead) {
-      ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(0, H / 2 - 10, W, 20);
-      ctx.fillStyle = PALETTE.flare;
-      ctx.textAlign = "center"; ctx.fillText("撃破されました　まもなく復活します", W / 2, H / 2 - 4);
-      ctx.textAlign = "left";
-    }
   }
 }
 
@@ -345,17 +397,19 @@ function frame() {
   // 自機は予測位置で描く（スナップショット本体は補正に使うので書き換えない）
   const tanks = interpolatedTanks().map((k) => (k.id === myId && pred ? { ...k, x: pred.x, y: pred.y, b: pred.body } : k));
   const me = tanks.find((k) => k.id === myId);
+  // 視界とカメラの元：自分が生きていれば自機、撃破中・観戦中はサーバーが選んだ味方
+  const view = tanks.find((k) => k.id === curr.view) || me;
   const mapW = map[0].length * TILE, mapH = map.length * TILE;
-  if (me) {
-    cam.x = clamp(Math.round(me.x - W / 2), 0, mapW - W);
-    cam.y = clamp(Math.round(me.y - H / 2), 0, mapH - H);
+  if (view) {
+    cam.x = clamp(Math.round(view.x - W / 2), 0, mapW - W);
+    cam.y = clamp(Math.round(view.y - H / 2), 0, mapH - H);
   }
   // 砲塔はマウスの向きへ、サーバーと同じ旋回速度の上限で回す（サーバーには目標の向きを送る）
   const target = localAim(me);
   if (me && pred) me.a = pred.aim = turnTurret(pred.type, pred.aim, target, dt);
-  sendInput(target);
+  if (me && !me.dead) sendInput(target);
   drawMap();
-  drawFog(me, me ? me.a : 0);
+  drawFog(view, view ? view.a : 0);
   ctx.fillStyle = PALETTE.bullet;
   for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);
@@ -390,9 +444,21 @@ function noise(dur, vol) {
   src.start();
 }
 
+// 試合の段階が変わったときの合図
+function playPhase(g, team) {
+  if (!audio) return;
+  if (g.ph === "countdown") tone(440, 440, 0.12, "square", 0.6);
+  else if (g.ph === "play") tone(880, 880, 0.25, "square", 0.7);
+  else if (g.ph === "roundEnd" || g.ph === "matchEnd") {
+    const r = g.ph === "roundEnd" ? g.rr : g.mr;
+    if (r === team) { tone(523, 1046, 0.3, "square", 0.6); } else { tone(400, 120, 0.5, "sawtooth", 0.6); }
+  }
+}
+
 function playEvent(e) {
   if (!audio || !curr) return;
-  const me = curr.tanks.find((k) => k.id === myId);
+  // 音の距離は、いま見ている視点（自機、または観戦中の味方）から測る
+  const me = curr.tanks.find((k) => k.id === curr.view);
   const dist = me ? Math.hypot(me.x - e.x, me.y - e.y) : 0;
   const vol = Math.max(0, 1 - dist / 260); // 遠いほど小さく
   if (vol <= 0) return;

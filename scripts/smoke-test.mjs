@@ -22,13 +22,30 @@ function join(tank, roomName = room, extra = "") {
       const m = JSON.parse(e.data);
       if (m.t === "init") grid ??= makeGrid(m.map);
       else if (m.t === "s") {
-        if (!c.id) { c.id = m.me; resolve(c); }
+        c.id = m.me; // 観戦中は null
+        c.last = m;
+        resolve(c);
         if (c.onSnap) c.onSnap(m);
       }
     };
   });
 }
 const debug = (c, m) => c.ws.send(JSON.stringify({ t: "dbg", ...m }));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 条件を満たすまで待つ（満たせば true、時間切れなら false）
+const until = (cond, ms = 5000) => new Promise((resolve) => {
+  const start = Date.now();
+  const iv = setInterval(() => {
+    if (cond()) { clearInterval(iv); resolve(true); } else if (Date.now() - start > ms) { clearInterval(iv); resolve(false); }
+  }, 20);
+});
+// 待機中の部屋をすぐ対戦に進める（部屋主が開始 → カウントダウンを飛ばす）
+async function startNow(owner) {
+  owner.ws.send(JSON.stringify({ t: "start" }));
+  await until(() => owner.last.g.ph === "countdown", 2000);
+  debug(owner, { phaseSec: 0 });
+  await until(() => owner.last.g.ph === "play", 2000);
+}
 // 入力には確認番号 q を付ける（クライアントの予測補正と同じ形式）
 const send = (c, m) => {
   if (c.ws.readyState !== 1) return;
@@ -42,6 +59,7 @@ const a = await join("medium"); // チームA：撃つ側
 debug(a, { freezeBots: true });
 const b = await join("medium"); // チームB：近づいて撃たれる側
 const c = await join("light"); // チームA：少し下へ動いて待機（味方表示・軽戦車の確認用）
+await startNow(a);
 const t0 = Date.now();
 
 // ===== 別の部屋：bot の巡回と、切断した戦車の引き継ぎ =====
@@ -51,6 +69,7 @@ const bots = { moved: 0, takenOver: false, alliesMax: 0, fires: 0 };
   const x = await join("medium", room2, "&bot=5"); // A。最初の人が bot の強さを決める
   await join("medium", room2); // B
   const z = await join("heavy", room2); // A。1秒後に切断する
+  await startNow(x);
   const start = new Map();
   x.onSnap = (m) => {
     const team = m.tanks.filter((k) => k.team === "A");
@@ -65,6 +84,54 @@ const bots = { moved: 0, takenOver: false, alliesMax: 0, fires: 0 };
     }
   };
   setTimeout(() => z.ws.close(), 1000);
+})();
+
+// ===== 別の部屋：殲滅モードの流れ（bot は止め、デバッグ用コマンドで状況を作る） =====
+const flow = [];
+const step = (name, ok, detail = "") => flow.push([name, ok, detail]);
+const flowDone = (async () => {
+  const room3 = room + "-match";
+  const p = await join("medium", room3); // A。部屋主
+  const q = await join("heavy", room3); // B
+  debug(p, { freezeBots: true });
+  const g = () => p.last.g;
+  step("待機から始まる（30秒）", await until(() => g().ph === "wait" && g().t > 20), `ph=${g().ph} t=${g().t}`);
+  q.ws.send(JSON.stringify({ t: "start" }));
+  await sleep(300);
+  step("部屋主以外は開始できない", g().ph === "wait", `ph=${g().ph}`);
+  p.ws.send(JSON.stringify({ t: "start" }));
+  await until(() => g().ph === "countdown");
+  const x0 = p.last.tanks.find((k) => k.id === p.id).x;
+  send(p, { mx: 1, my: 0 });
+  await sleep(500);
+  const x1 = p.last.tanks.find((k) => k.id === p.id).x;
+  step("カウントダウン中は動けない", g().ph === "countdown" && x0 === x1, `x=${x0}→${x1}`);
+  step("カウントダウン後に対戦が始まる", await until(() => g().ph === "play", 4000), `ph=${g().ph} t=${g().t}`);
+  send(p, { mx: 0, my: 0 });
+
+  const r = await join("light", room3); // 対戦中に参加 → 観戦
+  const rView = r.last.tanks.find((k) => k.id === r.last.view);
+  step("対戦中の参加者は味方の視点で観戦", r.id === null && rView?.team === r.last.team, `me=${r.id} view=${r.last.view}`);
+
+  debug(p, { killTeam: "B" });
+  step("全滅したチームの負け", await until(() => g().ph === "roundEnd" && g().rr === "A" && g().w[0] === 1), `rr=${g().rr} w=${g().w}`);
+  await sleep(1000);
+  step("殲滅モードは復活しない", q.last.tanks.filter((k) => k.team === "B").every((k) => k.dead), `al=${g().al}`);
+
+  debug(p, { phaseSec: 0 });
+  step("次のラウンドで観戦者が参加する", await until(() => g().r === 2 && r.id !== null), `r=${g().r} me=${r.id}`);
+  await until(() => g().ph === "countdown" || g().ph === "play");
+  debug(p, { phaseSec: 0 });
+  await until(() => g().ph === "play");
+  debug(p, { hpTeam: "B", hp: 1 });
+  await sleep(200);
+  debug(p, { phaseSec: 0 }); // 時間切れにする
+  step("時間切れは残りHPの合計で判定", await until(() => g().ph === "roundEnd" && g().rr === "A" && g().w[0] === 2), `rr=${g().rr} w=${g().w}`);
+  debug(p, { phaseSec: 0 });
+  step("2ラウンド先取で試合終了", await until(() => g().ph === "matchEnd" && g().mr === "A"), `mr=${g().mr}`);
+  debug(p, { phaseSec: 0 });
+  step("試合後は同じ部屋で待機に戻る", await until(() => g().ph === "wait" && g().w[0] === 0 && g().r === 1), `ph=${g().ph} w=${g().w}`);
+  step("部屋主にだけ owner が付く", p.last.g.owner === true && q.last.g.owner === false && r.last.g.owner === false);
 })();
 
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
@@ -148,7 +215,7 @@ a.onSnap = (m) => {
 b.onSnap = (m) => {
   snaps++;
   m.ev.forEach((x) => events.add(x.e));
-  const me = m.tanks.find((k) => k.id === b.id);
+  const me = m.tanks.find((k) => k.id === m.view); // 撃破後は味方の視点で絞り込まれる
   st.teamB = Math.max(st.teamB || 0, m.tanks.filter((k) => k.team === me.team).length);
   // Bの味方は止めた bot だけなので、届く弾はすべてAの弾。視界内のものだけのはず
   for (const [x, y] of m.bullets) canSeePoint(grid, view(me), x, y) ? st.bulletOk++ : st.bulletNg++;
@@ -158,7 +225,8 @@ b.onSnap = (m) => {
   if (!bTurned && Date.now() - t0 > 4000) { bTurned = true; send(b, { mx: -1, my: 0 }); }
 };
 
-setTimeout(() => {
+setTimeout(async () => {
+  await flowDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
@@ -166,6 +234,7 @@ setTimeout(() => {
     ["bot が巡回で動く", bots.moved > 0, `moved=${bots.moved}`],
     ["bot が敵を見つけて撃つ（Lv5の部屋）", bots.fires > 0, `fire=${bots.fires}`],
     ...botChecks(),
+    ...flow,
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
     ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,

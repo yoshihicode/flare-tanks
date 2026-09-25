@@ -10,7 +10,18 @@ import { Bot, type TeamIntel } from "./bot.ts";
 const TEAM_SIZE = 3; // 1チームの台数（3vs3）。空いた枠は bot が埋める
 const BULLET_SPEED = 180; // 弾速（px/秒）
 const BULLET_LIFE = 1.5; // 弾の寿命（秒）
-const RESPAWN_SEC = 3;
+// 殲滅モード（仕様書「ゲームモード」）。拠点制圧モードはステップ4で追加
+const MATCH = {
+  waitSec: 30, // 待機時間（部屋主は Enter ですぐ始められる）
+  countdownSec: 3, // ラウンド開始前のカウントダウン
+  roundSec: 600, // 1ラウンドの制限時間（10分）
+  roundEndSec: 4, // ラウンド結果の表示時間
+  matchEndSec: 8, // 試合結果の表示時間。その後は同じ部屋で次の試合の待機に戻る
+  winRounds: 2, // 2ラウンド先取
+  maxRounds: 3,
+};
+type Phase = "wait" | "countdown" | "play" | "roundEnd" | "matchEnd";
+type Result = Team | "draw";
 const BOT_LEVEL_DEFAULT = 3; // bot の強さ（1〜5）。部屋を作った人の指定がなければこれ
 // bot の枠の車種（チームごとに同じ並び）
 const BOT_TYPES: TankType[] = ["medium", "light", "heavy"];
@@ -26,7 +37,7 @@ interface Input { mx: number; my: number; aim: number; fire: boolean }
 interface Tank {
   id: string; team: Team; slot: number; type: TankType;
   x: number; y: number; body: number; aim: number;
-  hp: number; dead: boolean; respawnAt: number; cooldown: number;
+  hp: number; dead: boolean; cooldown: number;
   input: Input;
   human: string | null; // 操作している接続のID
   bot: Bot | null;
@@ -35,7 +46,7 @@ interface Tank {
 // 人間の接続
 interface Client {
   id: string; ws: WebSocket; team: Team; type: TankType;
-  tank: Tank | null;
+  tank: Tank | null; // null の間は観戦（対戦中に入った人は次のラウンドから参加）
   seq: number; // 最後に受け取った入力の確認番号（クライアントの予測補正用に返す）
 }
 interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team; damage: number }
@@ -111,6 +122,13 @@ export class Room extends DurableObject<Env> {
   botLevel = BOT_LEVEL_DEFAULT;
   intel: Record<Team, { last: TeamIntel | null }> = { A: { last: null }, B: { last: null } }; // bot の発見情報（レベル5）
   debug = { freezeBots: false };
+  // 試合の進行
+  phase: Phase = "wait";
+  phaseEndsAt = 0; // いまの段階が終わる時刻（秒）
+  round = 1;
+  wins: Record<Team, number> = { A: 0, B: 0 };
+  roundResult: Result | null = null;
+  matchResult: Result | null = null;
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -118,8 +136,7 @@ export class Room extends DurableObject<Env> {
     if (this.clients.size === 0) this.setupRoom(Number(url.searchParams.get("bot")));
     const type = toTankType(url.searchParams.get("tank"));
     const team = this.pickTeam();
-    const tank = this.tanks.find((t) => t.team === team && !t.human);
-    if (!tank) return new Response("満員です", { status: 503 });
+    if (!team) return new Response("満員です", { status: 503 });
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -127,7 +144,8 @@ export class Room extends DurableObject<Env> {
 
     const c: Client = { id: crypto.randomUUID().slice(0, 8), ws: server, team, type, tank: null, seq: 0 };
     this.clients.set(c.id, c);
-    this.takeOver(c, tank);
+    // 対戦が始まる前なら bot の枠をすぐ引き継ぐ。対戦中は観戦して次のラウンドから参加する
+    if (this.phase === "wait" || this.phase === "countdown") this.seat(c);
 
     server.addEventListener("message", (ev) => this.onMessage(c, ev.data));
     const leave = () => this.leave(c);
@@ -142,6 +160,7 @@ export class Room extends DurableObject<Env> {
   setupRoom(botLevel: number) {
     this.botLevel = Number.isInteger(botLevel) && botLevel >= 1 && botLevel <= 5 ? botLevel : BOT_LEVEL_DEFAULT;
     this.debug = { freezeBots: false };
+    this.newMatch(Date.now() / 1000);
     this.bullets = [];
     this.tanks = [];
     this.intel = { A: { last: null }, B: { last: null } };
@@ -149,7 +168,7 @@ export class Room extends DurableObject<Env> {
       for (let slot = 0; slot < TEAM_SIZE; slot++) {
         const t: Tank = {
           id: `${team}${slot}`, team, slot, type: BOT_TYPES[slot],
-          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, respawnAt: 0, cooldown: 0,
+          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0,
           input: { ...IDLE }, human: null, bot: null, hit: null,
         };
         t.bot = this.newBot(t);
@@ -165,13 +184,25 @@ export class Room extends DurableObject<Env> {
     return new Bot(this.botLevel, GRID, { home, enemyHome, intel: this.intel[t.team], bulletSpeed: BULLET_SPEED });
   }
 
-  // 人間の少ないチームへ入れる（同数ならA）
-  pickTeam(): Team {
+  // 人間の少ないチームへ入れる（同数ならA）。両チームとも人間で埋まっていれば null（満員）
+  pickTeam(): Team | null {
     const n = { A: 0, B: 0 };
     for (const c of this.clients.values()) n[c.team]++;
     const team: Team = n.A <= n.B ? "A" : "B";
-    // そのチームに空き枠がなければ反対側
-    return this.tanks.some((t) => t.team === team && !t.human) ? team : team === "A" ? "B" : "A";
+    const other: Team = team === "A" ? "B" : "A";
+    if (n[team] < TEAM_SIZE) return team;
+    return n[other] < TEAM_SIZE ? other : null;
+  }
+
+  // 観戦中の人をチームの bot 枠に座らせる
+  seat(c: Client) {
+    const t = this.tanks.find((t) => t.team === c.team && !t.human);
+    if (t) this.takeOver(c, t);
+  }
+
+  // 部屋主：いちばん早く入った人（Map は追加順）
+  get owner(): Client | undefined {
+    return this.clients.values().next().value;
   }
 
   // 人間が bot の枠を引き継ぐ。車種が違えば選んだ車種に乗り換えて出撃し直す
@@ -207,6 +238,11 @@ export class Room extends DurableObject<Env> {
     let m: any;
     try { m = JSON.parse(data); } catch { return; }
     if (m?.t === "dbg") return this.onDebug(m);
+    // 部屋主は待機中にすぐ開始できる
+    if (m?.t === "start") {
+      if (c === this.owner && this.phase === "wait") this.startRound(Date.now() / 1000);
+      return;
+    }
     if (m?.t !== "in" || !c.tank) return;
     c.tank.input = {
       mx: dir(m.mx), my: dir(m.my),
@@ -219,7 +255,76 @@ export class Room extends DurableObject<Env> {
   // 開発時だけ使えるテスト用コマンド（スモークテストで状況を作るため）
   onDebug(m: any) {
     if (this.env.DEBUG_TOOLS !== "1") return;
+    const now = Date.now() / 1000;
     if (typeof m.freezeBots === "boolean") this.debug.freezeBots = m.freezeBots;
+    if (Number.isFinite(m.phaseSec)) this.phaseEndsAt = now + m.phaseSec; // いまの段階の残り時間を変える
+    if (m.killTeam === "A" || m.killTeam === "B") {
+      for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; }
+    }
+    if ((m.hpTeam === "A" || m.hpTeam === "B") && Number.isInteger(m.hp)) {
+      for (const t of this.tanks) if (t.team === m.hpTeam && !t.dead) t.hp = m.hp;
+    }
+  }
+
+  // ===== 試合の進行（殲滅モード） =====
+  newMatch(now: number) {
+    this.phase = "wait";
+    this.phaseEndsAt = now + MATCH.waitSec;
+    this.round = 1;
+    this.wins = { A: 0, B: 0 };
+    this.roundResult = this.matchResult = null;
+  }
+
+  // ラウンド開始：観戦中の人を座らせ、全車を自陣に戻してカウントダウン
+  startRound(now: number) {
+    for (const c of this.clients.values()) if (!c.tank) this.seat(c);
+    this.intel = { A: { last: null }, B: { last: null } };
+    for (const t of this.tanks) {
+      this.spawn(t);
+      if (t.bot) t.bot = this.newBot(t); // 前のラウンドの記憶を持ち越さない
+    }
+    this.bullets = [];
+    this.roundResult = null;
+    this.phase = "countdown";
+    this.phaseEndsAt = now + MATCH.countdownSec;
+  }
+
+  // 段階の切り替え。対戦中は毎ティック勝敗を判定する
+  updatePhase(now: number) {
+    if (this.phase === "play") {
+      const alive = (team: Team) => this.tanks.filter((t) => t.team === team && !t.dead);
+      const a = alive("A"), b = alive("B");
+      if (!a.length || !b.length) {
+        // 全滅した側の負け（同時に全滅したら引き分け）
+        this.endRound(now, a.length ? "A" : b.length ? "B" : "draw");
+      } else if (now >= this.phaseEndsAt) {
+        // 時間切れは残りHPの合計が多い側の勝ち
+        const hp = (ts: Tank[]) => ts.reduce((sum, t) => sum + t.hp, 0);
+        this.endRound(now, hp(a) > hp(b) ? "A" : hp(b) > hp(a) ? "B" : "draw");
+      }
+      return;
+    }
+    if (now < this.phaseEndsAt) return;
+    if (this.phase === "wait") this.startRound(now);
+    else if (this.phase === "countdown") { this.phase = "play"; this.phaseEndsAt = now + MATCH.roundSec; }
+    else if (this.phase === "roundEnd") {
+      const done = this.wins.A >= MATCH.winRounds || this.wins.B >= MATCH.winRounds || this.round >= MATCH.maxRounds;
+      if (done) {
+        this.matchResult = this.wins.A > this.wins.B ? "A" : this.wins.B > this.wins.A ? "B" : "draw";
+        this.phase = "matchEnd";
+        this.phaseEndsAt = now + MATCH.matchEndSec;
+      } else {
+        this.round++;
+        this.startRound(now);
+      }
+    } else if (this.phase === "matchEnd") this.newMatch(now);
+  }
+
+  endRound(now: number, result: Result) {
+    this.roundResult = result;
+    if (result !== "draw") this.wins[result]++;
+    this.phase = "roundEnd";
+    this.phaseEndsAt = now + MATCH.roundEndSec;
   }
 
   startLoop() {
@@ -247,19 +352,20 @@ export class Room extends DurableObject<Env> {
   tick() {
     const now = Date.now() / 1000;
     const dt = TICK_MS / 1000;
+    this.updatePhase(now);
     this.thinkBots(now);
 
-    // 戦車の移動と射撃（人間も bot も同じ処理）
+    // 戦車の移動と射撃（人間も bot も同じ処理）。
+    // 待機中は動けるが撃てない（ウォームアップ）。カウントダウンと結果表示の間は止まる
+    const canMove = this.phase === "wait" || this.phase === "play";
+    const canFire = this.phase === "play";
     for (const t of this.tanks) {
-      if (t.dead) {
-        if (now >= t.respawnAt) this.spawn(t);
-        continue;
-      }
+      if (t.dead || !canMove) continue;
       stepTank(GRID, t, t.input.mx, t.input.my, dt);
       // 砲塔は入力の向きへ、車種ごとの旋回速度の上限で回す
       t.aim = turnTurret(t.type, t.aim, t.input.aim, dt);
       t.cooldown = Math.max(0, t.cooldown - dt);
-      if (t.input.fire && t.cooldown === 0) {
+      if (canFire && t.input.fire && t.cooldown === 0) {
         const spec = tankSpec(t.type);
         t.cooldown = spec.fireInterval;
         const bx = t.x + Math.cos(t.aim) * 10, by = t.y + Math.sin(t.aim) * 10;
@@ -288,8 +394,7 @@ export class Room extends DurableObject<Env> {
           t.hp = Math.max(0, t.hp - b.damage);
           t.hit = { dir: Math.atan2(-b.vy, -b.vx), at: now };
           if (t.hp === 0) {
-            t.dead = true;
-            t.respawnAt = now + RESPAWN_SEC;
+            t.dead = true; // 殲滅モードでは復活しない（次のラウンドで戻る）
             this.events.push({ e: "kill", x: r1(t.x), y: r1(t.y), team: t.team });
           } else {
             this.events.push({ e: "hit", x: r1(t.x), y: r1(t.y), team: t.team });
@@ -302,20 +407,35 @@ export class Room extends DurableObject<Env> {
 
     // スナップショット送信：人間ごとに視界で絞り込む（bot には送らない）
     for (const c of this.clients.values()) {
-      try { c.ws.send(this.snapshotFor(c)); } catch { /* 切断済みは close イベントで処理 */ }
+      try { c.ws.send(this.snapshotFor(c, now)); } catch { /* 切断済みは close イベントで処理 */ }
     }
     this.events = [];
   }
 
+  // 視点にする戦車：自分の戦車が生きていればそれ。撃破中・観戦中は生きている味方（自チームの視点のみ）
+  viewpoint(c: Client): Tank {
+    if (c.tank && !c.tank.dead) return c.tank;
+    return this.tanks.find((t) => t.team === c.team && !t.dead) ?? c.tank ?? this.tanks.find((t) => t.team === c.team)!;
+  }
+
   // 接続 c 用のスナップショット。見えない敵の座標・弾・出来事は含めない（チート対策）
-  // 味方と味方の弾は常に含める。自分が撃破中の間は、倒れた位置からの視界で判定する
-  snapshotFor(c: Client): string {
-    const v = c.tank!;
+  // 味方と味方の弾は常に含める
+  snapshotFor(c: Client, now: number): string {
+    const v = this.viewpoint(c);
     const seen = (x: number, y: number) => canSeePoint(GRID, v, x, y);
+    const alive = (team: Team) => this.tanks.filter((t) => t.team === team && !t.dead).length;
     return JSON.stringify({
       t: "s",
       q: c.seq,
-      me: v.id,
+      me: c.tank ? c.tank.id : null, // 自分の戦車（観戦中は null）
+      view: v.id, // 視界の元にした戦車
+      team: c.team,
+      // 試合の状態（座標は含まないので全員に送る）
+      g: {
+        ph: this.phase, t: Math.max(0, Math.ceil(this.phaseEndsAt - now)), r: this.round,
+        w: [this.wins.A, this.wins.B], wr: MATCH.winRounds, al: [alive("A"), alive("B")],
+        rr: this.roundResult, mr: this.matchResult, owner: c === this.owner,
+      },
       tanks: this.tanks
         .filter((t) => t.team === v.team || (!t.dead && canSeeTank(GRID, v, t)))
         .map((t) => ({
