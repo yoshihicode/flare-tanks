@@ -36,6 +36,16 @@
     }
     #msg { font-size: 1.1rem; }
     #help { font-size: 0.85rem; opacity: 0.75; line-height: 1.7; }
+    #tanks { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; }
+    #tanks button {
+      font: inherit; color: var(--ash); background: rgba(0, 0, 0, 0.35);
+      border: 2px solid #4a483e; padding: 0.6rem 0.9rem; min-width: 9.5rem;
+      cursor: pointer; text-align: left; line-height: 1.5;
+    }
+    #tanks button b { display: block; font-weight: 400; font-size: 1.1rem; color: var(--flare); }
+    #tanks button small { opacity: 0.75; }
+    #tanks button[aria-pressed="true"] { border-color: var(--flare); background: rgba(255, 179, 71, 0.12); }
+    #tanks button:focus-visible { outline: 2px solid var(--flare); outline-offset: 2px; }
     @media (prefers-reduced-motion: no-preference) {
       #overlay h1 { animation: flicker 3s infinite; }
       @keyframes flicker { 0%, 92%, 100% { opacity: 1 } 94% { opacity: 0.7 } 96% { opacity: 1 } 98% { opacity: 0.8 } }
@@ -46,7 +56,8 @@
   <canvas id="c" width="320" height="180"></canvas>
   <div id="overlay" role="button" tabindex="0">
     <h1>FLARE TANKS</h1>
-    <div id="msg">クリックして出撃</div>
+    <div id="tanks" role="group" aria-label="戦車の選択"></div>
+    <div id="msg">戦車を選んで出撃（1・2・3キーでも選べます）</div>
     <div id="help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃</div>
   </div>
   <script type="module" src="game.js"></script>

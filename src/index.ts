@@ -1,26 +1,30 @@
 import { DurableObject } from "cloudflare:workers";
 // 移動・壁判定はクライアントの予測処理と同じコードを使う
-import { TILE, TICK_MS, TANK, makeGrid, isWall as isWallAt, stepTank, canSeePoint, canSeeTank } from "../public/shared.js";
+import {
+  TILE, TICK_MS, TANK_TYPES, DEFAULT_TANK, tankSpec, makeGrid, isWall as isWallAt,
+  stepTank, turnTurret, canSeePoint, canSeeTank,
+} from "../public/shared.js";
 
-// ===== ゲーム定数（ステップ1の仮の値。戦車3種はステップ3で導入） =====
+// ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
 const MAX_PLAYERS = 6; // 1部屋の最大人数（3vs3）
 const BULLET_SPEED = 180; // 弾速（px/秒）
 const BULLET_LIFE = 1.5; // 弾の寿命（秒）
-const FIRE_INTERVAL = 0.6; // 連射間隔（秒）
-const DAMAGE = 25;
-const MAX_HP = 100;
 const RESPAWN_SEC = 3;
+
+type TankType = keyof typeof TANK_TYPES;
+const toTankType = (v: unknown): TankType =>
+  typeof v === "string" && v in TANK_TYPES ? (v as TankType) : (DEFAULT_TANK as TankType);
 
 type Team = "A" | "B";
 interface Input { mx: number; my: number; aim: number; fire: boolean }
 interface Player {
-  id: string; ws: WebSocket; team: Team;
+  id: string; ws: WebSocket; team: Team; type: TankType;
   x: number; y: number; body: number; aim: number;
   hp: number; dead: boolean; respawnAt: number; cooldown: number;
   input: Input;
   seq: number; // 最後に受け取った入力の確認番号（クライアントの予測補正用に返す）
 }
-interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team }
+interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team; damage: number }
 // team：その出来事に関わる戦車のチーム（発射した側・被弾した側・弾の持ち主）。同じチームには常に送る
 interface GameEvent { e: "fire" | "hit" | "kill" | "wall"; x: number; y: number; team: Team }
 
@@ -86,7 +90,7 @@ export class Room extends DurableObject<Env> {
   events: GameEvent[] = [];
   timer: ReturnType<typeof setInterval> | null = null;
 
-  async fetch(_req: Request): Promise<Response> {
+  async fetch(req: Request): Promise<Response> {
     if (this.players.size >= MAX_PLAYERS) {
       return new Response("満員です", { status: 503 });
     }
@@ -96,9 +100,9 @@ export class Room extends DurableObject<Env> {
 
     const id = crypto.randomUUID().slice(0, 8);
     const p: Player = {
-      id, ws: server, team: this.pickTeam(),
+      id, ws: server, team: this.pickTeam(), type: toTankType(new URL(req.url).searchParams.get("tank")),
       x: 0, y: 0, body: 0, aim: 0,
-      hp: MAX_HP, dead: false, respawnAt: 0, cooldown: 0,
+      hp: 0, dead: false, respawnAt: 0, cooldown: 0,
       input: { mx: 0, my: 0, aim: 0, fire: false },
       seq: 0,
     };
@@ -126,7 +130,7 @@ export class Room extends DurableObject<Env> {
 
   spawn(p: Player) {
     const s = spawnPoint(p.team, Math.floor(Math.random() * 3));
-    Object.assign(p, { x: s.x, y: s.y, body: s.body, aim: s.body, hp: MAX_HP, dead: false, cooldown: 0 });
+    Object.assign(p, { x: s.x, y: s.y, body: s.body, aim: s.body, hp: tankSpec(p.type).hp, dead: false, cooldown: 0 });
   }
 
   onMessage(p: Player, data: unknown) {
@@ -163,15 +167,17 @@ export class Room extends DurableObject<Env> {
         continue;
       }
       stepTank(GRID, p, p.input.mx, p.input.my, dt);
-      p.aim = p.input.aim;
+      // 砲塔は入力の向きへ、車種ごとの旋回速度の上限で回す
+      p.aim = turnTurret(p.type, p.aim, p.input.aim, dt);
       p.cooldown = Math.max(0, p.cooldown - dt);
       if (p.input.fire && p.cooldown === 0) {
-        p.cooldown = FIRE_INTERVAL;
+        const spec = tankSpec(p.type);
+        p.cooldown = spec.fireInterval;
         const bx = p.x + Math.cos(p.aim) * 10, by = p.y + Math.sin(p.aim) * 10;
         this.bullets.push({
           x: bx, y: by,
           vx: Math.cos(p.aim) * BULLET_SPEED, vy: Math.sin(p.aim) * BULLET_SPEED,
-          life: BULLET_LIFE, team: p.team,
+          life: BULLET_LIFE, team: p.team, damage: spec.damage,
         });
         this.events.push({ e: "fire", x: r1(bx), y: r1(by), team: p.team });
       }
@@ -189,10 +195,9 @@ export class Room extends DurableObject<Env> {
       }
       for (const p of this.players.values()) {
         if (p.dead || p.team === b.team) continue;
-        if (Math.hypot(p.x - b.x, p.y - b.y) < TANK.r + 2) {
-          p.hp -= DAMAGE;
-          if (p.hp <= 0) {
-            p.hp = 0;
+        if (Math.hypot(p.x - b.x, p.y - b.y) < tankSpec(p.type).r + 2) {
+          p.hp = Math.max(0, p.hp - b.damage);
+          if (p.hp === 0) {
             p.dead = true;
             p.respawnAt = now + RESPAWN_SEC;
             this.events.push({ e: "kill", x: r1(p.x), y: r1(p.y), team: p.team });
@@ -223,7 +228,7 @@ export class Room extends DurableObject<Env> {
       tanks: tanks
         .filter((p) => p.team === v.team || (!p.dead && canSeeTank(GRID, v, p)))
         .map((p) => ({
-          id: p.id, team: p.team, x: r1(p.x), y: r1(p.y),
+          id: p.id, team: p.team, k: p.type, x: r1(p.x), y: r1(p.y),
           b: r2(p.body), a: r2(p.aim), hp: p.hp, dead: p.dead,
         })),
       bullets: this.bullets

@@ -4,16 +4,34 @@
 // ===== 共有パラメータ =====
 export const TILE = 16; // 1タイルのピクセル数
 export const TICK_MS = 50; // サーバー更新間隔（20Hz）
-export const TANK = {
-  r: 6, // 当たり判定半径（px）
-  speed: 60, // 移動速度（px/秒）
+const DEG = Math.PI / 180;
+// 戦車3種の性能。試遊しながらここだけを調整する（仕様書「戦車3種」の初期値案）
+export const TANK_TYPES = {
+  light: {
+    name: "軽戦車", role: "偵察・拠点奪取",
+    r: 5, // 当たり判定半径（px）
+    speed: 90, // 移動速度（px/秒。中戦車の1.5倍）
+    hp: 60,
+    fireInterval: 0.25, // 連射間隔（秒）
+    damage: 10,
+    fov: 120 * DEG, // 扇形視界の視野角
+    range: 208, // 扇形視界の距離（px、13タイル）
+    turn: 360 * DEG, // 砲塔の旋回速度（ラジアン/秒）
+  },
+  medium: {
+    name: "中戦車", role: "万能",
+    r: 6, speed: 60, hp: 100, fireInterval: 0.6, damage: 25,
+    fov: 90 * DEG, range: 160, turn: 200 * DEG,
+  },
+  heavy: {
+    name: "重戦車", role: "拠点防衛・撃ち合い",
+    r: 7, speed: 36, hp: 160, fireInterval: 1.2, damage: 50,
+    fov: 60 * DEG, range: 160, turn: 100 * DEG,
+  },
 };
-// 視界（ステップ3で戦車ごとの値に分ける。いまは中戦車相当）
-export const VISION = {
-  fov: Math.PI / 2, // 扇形視界の視野角（約90°）
-  range: 160, // 扇形視界の距離（px、10タイル）
-  near: 40, // 全周視界の半径（px、2.5タイル）
-};
+export const DEFAULT_TANK = "medium";
+export const tankSpec = (type) => TANK_TYPES[type] || TANK_TYPES[DEFAULT_TANK];
+export const NEAR_VIEW = 40; // 全周視界の半径（px、2.5タイル。全車種共通）
 
 // ===== マップ =====
 // map は "#"（壁）と "."（床）の文字列配列
@@ -35,15 +53,23 @@ export function hitsWall(g, x, y, r) {
 }
 
 // ===== 移動 =====
-// 戦車を1ステップ動かす（t は {x, y, body} を持つオブジェクトで、直接書き換える）。
+// 戦車を1ステップ動かす（t は {x, y, body, type} を持つオブジェクトで、直接書き換える）。
 // 壁に当たったら軸ごとに止めて、壁沿いに滑らせる
 export function stepTank(g, t, mx, my, dt) {
   const len = Math.hypot(mx, my);
   if (len === 0) return;
-  const dx = (mx / len) * TANK.speed * dt, dy = (my / len) * TANK.speed * dt;
-  if (!hitsWall(g, t.x + dx, t.y, TANK.r)) t.x += dx;
-  if (!hitsWall(g, t.x, t.y + dy, TANK.r)) t.y += dy;
+  const s = tankSpec(t.type);
+  const dx = (mx / len) * s.speed * dt, dy = (my / len) * s.speed * dt;
+  if (!hitsWall(g, t.x + dx, t.y, s.r)) t.x += dx;
+  if (!hitsWall(g, t.x, t.y + dy, s.r)) t.y += dy;
   t.body = Math.atan2(my, mx);
+}
+
+// 砲塔を目標の向きへ、1ステップで最大 turn*dt だけ回した角度を返す
+export function turnTurret(type, cur, target, dt) {
+  const max = tankSpec(type).turn * dt;
+  const d = angleDiff(target, cur);
+  return Math.abs(d) <= max ? target : cur + Math.sign(d) * max;
 }
 
 // ===== 視界 =====
@@ -70,22 +96,24 @@ export function lineOfSight(g, x0, y0, x1, y1) {
   return true;
 }
 
-// 視点 v {x, y, aim} から点 (x, y) が見えるか：
-// 「全周視界の内側」または「扇形視界の内側」で、かつ見通し線が通ること
+// 視点 v {x, y, aim, type} から点 (x, y) が見えるか：
+// 「全周視界の内側」または「扇形視界（視野角・距離は車種ごと）の内側」で、かつ見通し線が通ること
 export function canSeePoint(g, v, x, y) {
+  const s = tankSpec(v.type);
   const d = Math.hypot(x - v.x, y - v.y);
-  if (d > VISION.near) {
-    if (d > VISION.range) return false;
-    if (Math.abs(angleDiff(Math.atan2(y - v.y, x - v.x), v.aim)) > VISION.fov / 2) return false;
+  if (d > NEAR_VIEW) {
+    if (d > s.range) return false;
+    if (Math.abs(angleDiff(Math.atan2(y - v.y, x - v.x), v.aim)) > s.fov / 2) return false;
   }
   return lineOfSight(g, v.x, v.y, x, y);
 }
 
-// 戦車 t {x, y} が見えるか。中心と、視線に垂直な左右の端のどれか1点でも見えれば見える
+// 戦車 t {x, y, type} が見えるか。中心と、視線に垂直な左右の端のどれか1点でも見えれば見える
 export function canSeeTank(g, v, t) {
   if (canSeePoint(g, v, t.x, t.y)) return true;
   const d = Math.hypot(t.x - v.x, t.y - v.y) || 1;
-  const px = (-(t.y - v.y) / d) * TANK.r, py = ((t.x - v.x) / d) * TANK.r;
+  const r = tankSpec(t.type).r;
+  const px = (-(t.y - v.y) / d) * r, py = ((t.x - v.x) / d) * r;
   return canSeePoint(g, v, t.x + px, t.y + py) || canSeePoint(g, v, t.x - px, t.y - py);
 }
 

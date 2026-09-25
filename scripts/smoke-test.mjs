@@ -1,6 +1,8 @@
 // 動作確認用：3クライアント（A・B・Aの順に参加）で接続し、撃ち合いと視界の絞り込みを確認する
 // 使い方：別ターミナルで `npm run dev` を起動してから `npm run test:smoke`
-import { makeGrid, stepTank, canSeePoint, canSeeTank, lineOfSight, visibilityPolygon, isWall, TICK_MS, TILE, VISION } from "../public/shared.js";
+import {
+  makeGrid, stepTank, canSeePoint, canSeeTank, lineOfSight, visibilityPolygon, isWall, angleDiff, tankSpec, TICK_MS, TILE,
+} from "../public/shared.js";
 
 const BASE = process.env.WS_URL || "ws://localhost:8787/ws";
 const room = "smoke-" + Date.now();
@@ -8,9 +10,9 @@ const DURATION = 20000;
 let grid = null;
 
 // 参加して init を受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
-function join() {
+function join(tank) {
   return new Promise((resolve, reject) => {
-    const c = { ws: new WebSocket(`${BASE}?room=${room}`), id: null, onSnap: null };
+    const c = { ws: new WebSocket(`${BASE}?room=${room}&tank=${tank}`), id: null, onSnap: null };
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
@@ -26,11 +28,11 @@ const send = (c, m) => {
   c.sentAt = { ...c.sentAt, [c.q]: Date.now() };
   c.ws.send(JSON.stringify({ t: "in", q: c.q, aim: 0, fire: false, ...m }));
 };
-const view = (k) => ({ x: k.x, y: k.y, aim: k.a });
+const view = (k) => ({ x: k.x, y: k.y, aim: k.a, type: k.k });
 
-const a = await join(); // チームA：撃つ側
-const b = await join(); // チームB：近づいて撃たれる側
-const c = await join(); // チームA：その場で待機（味方表示の確認用）
+const a = await join("medium"); // チームA：撃つ側
+const b = await join("medium"); // チームB：近づいて撃たれる側
+const c = await join("light"); // チームA：少し下へ動いて待機（味方表示・軽戦車の確認用）
 const t0 = Date.now();
 
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
@@ -46,9 +48,10 @@ const poly = { same: 0, diff: 0 };
 for (let n = 0; n < 200; n++) {
   const vx = Math.random() * grid.w * TILE, vy = Math.random() * grid.h * TILE;
   if (isWall(grid, vx, vy)) continue;
-  const pts = visibilityPolygon(grid, vx, vy, VISION.range);
+  const range = tankSpec("medium").range;
+  const pts = visibilityPolygon(grid, vx, vy, range);
   for (let k = 0; k < 50; k++) {
-    const r = Math.random() * VISION.range * 0.95, th = Math.random() * Math.PI * 2;
+    const r = Math.random() * range * 0.95, th = Math.random() * Math.PI * 2;
     const px = vx + Math.cos(th) * r, py = vy + Math.sin(th) * r;
     if (isWall(grid, px, py)) continue;
     inPolygon(pts, px, py) === lineOfSight(grid, vx, vy, px, py) ? poly.same++ : poly.diff++;
@@ -66,32 +69,43 @@ const st = {
   bulletOk: 0, bulletNg: 0, // Bに送られた（Aの）弾が視界内か
   fireOk: 0, fireNg: 0, // Bに送られた発射イベントが視界内か（自チーム分を除く）
   lastAck: 0, rtts: [], // サーバーが返した確認番号と、そこから測った往復時間
+  hpOk: 0, hpNg: 0, // 各戦車の初期HPが車種どおりか
+  turnMax: 0, // Aの砲塔が1ティックで回った最大角度
 };
 const ratioOk = (ok, ng, min) => ok > 0 && ok / (ok + ng) >= min;
 
 // A・Bとも上部の通路へ移動 → Bは左へ接近 → Aは見えたら狙って撃つ
 send(a, { mx: 0, my: -1 });
 send(b, { mx: 0, my: -1 });
-let bTurned = false, aPrev = null;
+send(c, { mx: 0, my: 1 });
+setTimeout(() => send(c, { mx: 0, my: 0 }), 1500);
+setTimeout(() => send(a, { mx: 0, my: -1, aim: 3.14 }), 3500); // 180°振り向かせて旋回の上限を確かめる
+let bTurned = false, aPrev = null, cPrev = null;
+
+// サーバーの移動結果が共有の stepTank と一致するか（入力が一定の間だけ比べる）
+function checkMove(prevK, k, mx, my) {
+  const p = { x: prevK.x, y: prevK.y, body: 0, type: prevK.k };
+  stepTank(grid, p, mx, my, TICK_MS / 1000);
+  Math.abs(p.x - k.x) < 0.15 && Math.abs(p.y - k.y) < 0.15 ? st.moveSame++ : st.moveDiff++;
+}
 
 a.onSnap = (m) => {
   const el = Date.now() - t0;
   if (m.q > st.lastAck) { st.rtts.push(Date.now() - a.sentAt[m.q]); st.lastAck = m.q; }
   const me = m.tanks.find((k) => k.id === a.id);
   const en = m.tanks.find((k) => k.team !== me.team);
-  m.tanks.some((k) => k.id === c.id) ? st.allyShown++ : st.allyMissing++;
+  const ally = m.tanks.find((k) => k.id === c.id);
+  ally ? st.allyShown++ : st.allyMissing++;
+  if (el < 400) for (const k of m.tanks) k.hp === tankSpec(k.k).hp ? st.hpOk++ : st.hpNg++;
   if (en) {
     if (el < 2000) st.earlyLeak++;
     canSeeTank(grid, view(me), en) ? st.enemyOk++ : st.enemyNg++;
   }
 
-  // サーバーの移動結果が共有の stepTank と一致するか（入力が上移動で一定の間だけ比べる）
-  if (aPrev && el > 500 && el < 3500) {
-    const pred = { x: aPrev.x, y: aPrev.y, body: 0 };
-    stepTank(grid, pred, 0, -1, TICK_MS / 1000);
-    Math.abs(pred.x - me.x) < 0.15 && Math.abs(pred.y - me.y) < 0.15 ? st.moveSame++ : st.moveDiff++;
-  }
-  aPrev = me;
+  if (aPrev && el > 500 && el < 3500) checkMove(aPrev, me, 0, -1);
+  if (cPrev && ally && el > 300 && el < 1300) checkMove(cPrev, ally, 0, 1);
+  if (aPrev) st.turnMax = Math.max(st.turnMax, Math.abs(angleDiff(me.a, aPrev.a)));
+  aPrev = me; cPrev = ally;
 
   if (el < 4000) return;
   if (en) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(en.y - me.y, en.x - me.x) * 100) / 100, fire: true });
@@ -113,7 +127,10 @@ setTimeout(() => {
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
-    ["移動が共有コードと一致 ≥95%", st.moveSame > 20 && ratioOk(st.moveSame, st.moveDiff, 0.95), `same=${st.moveSame} diff=${st.moveDiff}`],
+    ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
+    ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,
+      `max=${st.turnMax.toFixed(3)}rad/tick`],
+    ["移動が共有コードと一致 ≥95%", st.moveSame > 30 && ratioOk(st.moveSame, st.moveDiff, 0.95), `same=${st.moveSame} diff=${st.moveDiff}`],
     ["入力の確認番号が返る", st.lastAck === a.q && st.lastAck > 1, `ack=${st.lastAck} sent=${a.q}`],
     ["確認番号の往復 <500ms", st.rtts.length > 0 && Math.max(...st.rtts) < 500, `max=${Math.max(...st.rtts)}ms`],
     ["可視ポリゴンが見通し線と一致 ≥98%", ratioOk(poly.same, poly.diff, 0.98), `same=${poly.same} diff=${poly.diff}`],

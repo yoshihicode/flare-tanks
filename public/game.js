@@ -1,4 +1,4 @@
-import { TILE, VISION, makeGrid, stepTank, visibilityPolygon } from "./shared.js";
+import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
 const W = 320, H = 180;
@@ -46,16 +46,42 @@ const PREDICT = {
   correct: 0.15, // スナップショット1回ごとに縮めるずれの割合
   historyMs: 1000, // 予測位置の履歴を残す長さ
 };
-let pred = null; // 予測中の自機 {x, y, body}
+let pred = null; // 予測中の自機 {x, y, body, aim, type}
 let history = []; // [{t, x, y}] 過去の予測位置
 let seq = 0; // 入力の確認番号
 const sentAt = new Map(); // 確認番号 → 送信時刻
 let rtt = 100; // 入力がサーバーに反映されて戻るまでの時間（ms、平滑化）
 let lastFrameAt = performance.now();
 
+// ===== 戦車の選択（タイトル画面） =====
+const TANK_ORDER = ["light", "medium", "heavy"];
+let tankType = DEFAULT_TANK;
+try { const saved = localStorage.getItem("ft.tank"); if (saved in TANK_TYPES) tankType = saved; } catch { /* 保存できない環境では既定値 */ }
+const tankButtons = document.getElementById("tanks");
+for (const type of TANK_ORDER) {
+  const s = TANK_TYPES[type];
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.dataset.type = type;
+  btn.innerHTML = `<b>${s.name}</b><small>${s.role}<br>HP ${s.hp}・ダメージ ${s.damage}<br>視野角 ${Math.round((s.fov * 180) / Math.PI)}°</small>`;
+  btn.addEventListener("click", (e) => { e.stopPropagation(); chooseTank(type); start(); });
+  tankButtons.append(btn);
+}
+function chooseTank(type) {
+  tankType = type;
+  try { localStorage.setItem("ft.tank", type); } catch { /* 保存できなくても続行 */ }
+  for (const b of tankButtons.children) b.setAttribute("aria-pressed", String(b.dataset.type === type));
+}
+chooseTank(tankType);
+
 // ===== 開始・接続 =====
 overlay.addEventListener("click", start);
-overlay.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") start(); });
+addEventListener("keydown", (e) => {
+  if (overlay.style.display === "none") return;
+  const i = ["Digit1", "Digit2", "Digit3"].indexOf(e.code);
+  if (i >= 0) chooseTank(TANK_ORDER[i]);
+  if (e.key === "Enter") start();
+});
 
 function start() {
   // iOS対策：ユーザー操作の中で音を有効化する
@@ -73,7 +99,7 @@ function showOverlay(text) {
 function connect() {
   const room = new URLSearchParams(location.search).get("room") || "default";
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws?room=${encodeURIComponent(room)}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws?room=${encodeURIComponent(room)}&tank=${tankType}`);
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
@@ -145,7 +171,7 @@ function moveInput() {
 function predict(dt) {
   const me = curr && curr.tanks.find((k) => k.id === myId);
   if (!me || me.dead) { pred = null; history = []; return; }
-  if (!pred) pred = { x: me.x, y: me.y, body: me.b };
+  if (!pred) pred = { x: me.x, y: me.y, body: me.b, aim: me.a, type: me.k };
   const { mx, my } = moveInput();
   stepTank(grid, pred, mx, my, dt);
   const now = performance.now();
@@ -167,7 +193,7 @@ function reconcile(m) {
   const past = history.find((h) => h.t >= target) || { x: pred.x, y: pred.y };
   const ex = me.x - past.x, ey = me.y - past.y;
   if (Math.hypot(ex, ey) > PREDICT.snapDist) {
-    pred = { x: me.x, y: me.y, body: me.b };
+    pred = { x: me.x, y: me.y, body: me.b, aim: me.a, type: me.k };
     history = [];
     return;
   }
@@ -216,31 +242,40 @@ function drawMap() {
   }
 }
 
+// 車種ごとの見た目（l：車体の半分の長さ、w：半分の幅、gun：砲身の長さ、head：砲塔の大きさ）
+const SPRITE = {
+  light: { l: 5, w: 3, gun: 7, head: 3 },
+  medium: { l: 6, w: 4, gun: 9, head: 4 },
+  heavy: { l: 7, w: 5, gun: 10, head: 6 },
+};
+
 function drawTank(k, isMe) {
   const x = Math.round(k.x - cam.x), y = Math.round(k.y - cam.y);
+  const sp = SPRITE[k.k] || SPRITE.medium;
   // 車体（8方向にスナップしてドット感を保つ）
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(snap8(k.b));
   ctx.fillStyle = PALETTE.tread;
-  ctx.fillRect(-6, -6, 12, 3);
-  ctx.fillRect(-6, 3, 12, 3);
+  ctx.fillRect(-sp.l, -sp.w - 2, sp.l * 2, 3);
+  ctx.fillRect(-sp.l, sp.w - 1, sp.l * 2, 3);
   ctx.fillStyle = PALETTE[k.team];
-  ctx.fillRect(-5, -4, 10, 8);
+  ctx.fillRect(-sp.l + 1, -sp.w, sp.l * 2 - 2, sp.w * 2);
   ctx.restore();
   // 砲塔
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(k.a);
   ctx.fillStyle = "#e9e4d4";
-  ctx.fillRect(0, -1, 9, 2);
+  ctx.fillRect(0, -1, sp.gun, 2);
   ctx.fillStyle = isMe ? PALETTE.flare : "#e9e4d4";
-  ctx.fillRect(-2, -2, 4, 4);
+  ctx.fillRect(-sp.head / 2, -sp.head / 2, sp.head, sp.head);
   ctx.restore();
-  // HPバー
-  ctx.fillStyle = PALETTE.hpBack; ctx.fillRect(x - 6, y - 10, 12, 2);
+  // HPバー（車種ごとの最大HPに対する割合）
+  const top = y - sp.l - 4;
+  ctx.fillStyle = PALETTE.hpBack; ctx.fillRect(x - 6, top, 12, 2);
   ctx.fillStyle = isMe ? PALETTE.flare : PALETTE.hpFore;
-  ctx.fillRect(x - 6, y - 10, Math.round((12 * k.hp) / 100), 2);
+  ctx.fillRect(x - 6, top, Math.round((12 * k.hp) / tankSpec(k.k).hp), 2);
 }
 
 // 可視ポリゴン ∩（扇形 ∪ 全周の円）の外側を暗くする。
@@ -252,7 +287,8 @@ function drawFog(me, aim) {
   fog.fillRect(0, 0, W, H);
   if (!me) return ctx.drawImage(fogCv, 0, 0);
   const x = me.x - cam.x, y = me.y - cam.y;
-  const pts = visibilityPolygon(grid, me.x, me.y, VISION.range);
+  const spec = tankSpec(me.k);
+  const pts = visibilityPolygon(grid, me.x, me.y, spec.range);
   fog.save();
   fog.beginPath();
   pts.forEach(([px, py], i) => (i ? fog.lineTo(px - cam.x, py - cam.y) : fog.moveTo(px - cam.x, py - cam.y)));
@@ -262,11 +298,11 @@ function drawFog(me, aim) {
   fog.fillStyle = "#000";
   fog.beginPath();
   fog.moveTo(x, y);
-  fog.arc(x, y, VISION.range, aim - VISION.fov / 2, aim + VISION.fov / 2);
+  fog.arc(x, y, spec.range, aim - spec.fov / 2, aim + spec.fov / 2);
   fog.closePath();
   fog.fill();
   fog.beginPath();
-  fog.arc(x, y, VISION.near, 0, Math.PI * 2);
+  fog.arc(x, y, NEAR_VIEW, 0, Math.PI * 2);
   fog.fill();
   fog.restore();
   ctx.drawImage(fogCv, 0, 0);
@@ -282,7 +318,9 @@ function drawHud(me) {
   ctx.fillStyle = PALETTE.B; ctx.fillText(`B ${b}`, 30, 2);
   if (me) {
     ctx.fillStyle = PALETTE.flare;
-    ctx.fillText(`HP ${me.hp}`, W - 40, 2);
+    ctx.textAlign = "right";
+    ctx.fillText(`${tankSpec(me.k).name}  HP ${me.hp}`, W - 4, 2);
+    ctx.textAlign = "left";
     if (me.dead) {
       ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(0, H / 2 - 10, W, 20);
       ctx.fillStyle = PALETTE.flare;
@@ -300,7 +338,8 @@ function frame() {
     return;
   }
   const nowMs = performance.now();
-  predict(Math.min(0.05, (nowMs - lastFrameAt) / 1000));
+  const dt = Math.min(0.05, (nowMs - lastFrameAt) / 1000);
+  predict(dt);
   lastFrameAt = nowMs;
   // 自機は予測位置で描く（スナップショット本体は補正に使うので書き換えない）
   const tanks = interpolatedTanks().map((k) => (k.id === myId && pred ? { ...k, x: pred.x, y: pred.y, b: pred.body } : k));
@@ -310,11 +349,12 @@ function frame() {
     cam.x = clamp(Math.round(me.x - W / 2), 0, mapW - W);
     cam.y = clamp(Math.round(me.y - H / 2), 0, mapH - H);
   }
-  const aim = localAim(me);
-  if (me && pred) me.a = aim; // 砲塔もマウスの現在の向きで描く
-  sendInput(aim);
+  // 砲塔はマウスの向きへ、サーバーと同じ旋回速度の上限で回す（サーバーには目標の向きを送る）
+  const target = localAim(me);
+  if (me && pred) me.a = pred.aim = turnTurret(pred.type, pred.aim, target, dt);
+  sendInput(target);
   drawMap();
-  drawFog(me, aim);
+  drawFog(me, me ? me.a : 0);
   ctx.fillStyle = PALETTE.bullet;
   for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);
