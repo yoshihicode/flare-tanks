@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 // 移動・壁判定はクライアントの予測処理と同じコードを使う
-import { TILE, TICK_MS, TANK, makeGrid, isWall as isWallAt, stepTank } from "../public/shared.js";
+import { TILE, TICK_MS, TANK, makeGrid, isWall as isWallAt, stepTank, canSeePoint, canSeeTank } from "../public/shared.js";
 
 // ===== ゲーム定数（ステップ1の仮の値。戦車3種はステップ3で導入） =====
 const MAX_PLAYERS = 6; // 1部屋の最大人数（3vs3）
@@ -20,7 +20,8 @@ interface Player {
   input: Input;
 }
 interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team }
-interface GameEvent { e: "fire" | "hit" | "kill" | "wall"; x: number; y: number }
+// team：その出来事に関わる戦車のチーム（発射した側・被弾した側・弾の持ち主）。同じチームには常に送る
+interface GameEvent { e: "fire" | "hit" | "kill" | "wall"; x: number; y: number; team: Team }
 
 interface Env { ROOM: DurableObjectNamespace }
 
@@ -169,7 +170,7 @@ export class Room extends DurableObject<Env> {
           vx: Math.cos(p.aim) * BULLET_SPEED, vy: Math.sin(p.aim) * BULLET_SPEED,
           life: BULLET_LIFE, team: p.team,
         });
-        this.events.push({ e: "fire", x: r1(bx), y: r1(by) });
+        this.events.push({ e: "fire", x: r1(bx), y: r1(by), team: p.team });
       }
     }
 
@@ -180,7 +181,7 @@ export class Room extends DurableObject<Env> {
       b.life -= dt;
       if (b.life <= 0) return false;
       if (isWall(b.x, b.y)) {
-        this.events.push({ e: "wall", x: r1(b.x), y: r1(b.y) });
+        this.events.push({ e: "wall", x: r1(b.x), y: r1(b.y), team: b.team });
         return false;
       }
       for (const p of this.players.values()) {
@@ -191,9 +192,9 @@ export class Room extends DurableObject<Env> {
             p.hp = 0;
             p.dead = true;
             p.respawnAt = now + RESPAWN_SEC;
-            this.events.push({ e: "kill", x: r1(p.x), y: r1(p.y) });
+            this.events.push({ e: "kill", x: r1(p.x), y: r1(p.y), team: p.team });
           } else {
-            this.events.push({ e: "hit", x: r1(p.x), y: r1(p.y) });
+            this.events.push({ e: "hit", x: r1(p.x), y: r1(p.y), team: p.team });
           }
           return false;
         }
@@ -201,19 +202,32 @@ export class Room extends DurableObject<Env> {
       return true;
     });
 
-    // スナップショット送信（視界による絞り込みはステップ2で追加）
-    const snap = JSON.stringify({
-      t: "s",
-      tanks: [...this.players.values()].map((p) => ({
-        id: p.id, team: p.team, x: r1(p.x), y: r1(p.y),
-        b: r2(p.body), a: r2(p.aim), hp: p.hp, dead: p.dead,
-      })),
-      bullets: this.bullets.map((b) => [Math.round(b.x), Math.round(b.y)]),
-      ev: this.events,
-    });
-    this.events = [];
-    for (const p of this.players.values()) {
-      try { p.ws.send(snap); } catch { /* 切断済みは close イベントで処理 */ }
+    // スナップショット送信：プレイヤーごとに視界で絞り込む
+    const tanks = [...this.players.values()];
+    for (const v of this.players.values()) {
+      try { v.ws.send(this.snapshotFor(v, tanks)); } catch { /* 切断済みは close イベントで処理 */ }
     }
+    this.events = [];
+  }
+
+  // 視点 v 用のスナップショット。見えない敵の座標・弾・出来事は含めない（チート対策）
+  // 味方と味方の弾は常に含める。視点側が撃破中の間は、倒れた位置からの視界で判定する
+  snapshotFor(v: Player, tanks: Player[]): string {
+    const seen = (x: number, y: number) => canSeePoint(GRID, v, x, y);
+    return JSON.stringify({
+      t: "s",
+      tanks: tanks
+        .filter((p) => p.team === v.team || (!p.dead && canSeeTank(GRID, v, p)))
+        .map((p) => ({
+          id: p.id, team: p.team, x: r1(p.x), y: r1(p.y),
+          b: r2(p.body), a: r2(p.aim), hp: p.hp, dead: p.dead,
+        })),
+      bullets: this.bullets
+        .filter((b) => b.team === v.team || seen(b.x, b.y))
+        .map((b) => [Math.round(b.x), Math.round(b.y)]),
+      ev: this.events
+        .filter((e) => e.team === v.team || seen(e.x, e.y))
+        .map(({ e, x, y }) => ({ e, x, y })),
+    });
   }
 }

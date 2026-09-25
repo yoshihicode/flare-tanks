@@ -1,61 +1,97 @@
-// 動作確認用：2クライアントで接続し、撃ち合って被弾・撃破イベントが出るか確認する
+// 動作確認用：3クライアント（A・B・Aの順に参加）で接続し、撃ち合いと視界の絞り込みを確認する
 // 使い方：別ターミナルで `npm run dev` を起動してから `npm run test:smoke`
-import { makeGrid, stepTank, TICK_MS } from "../public/shared.js";
+import { makeGrid, stepTank, canSeePoint, canSeeTank, TICK_MS } from "../public/shared.js";
 
 const BASE = process.env.WS_URL || "ws://localhost:8787/ws";
 const room = "smoke-" + Date.now();
-const a = new WebSocket(`${BASE}?room=${room}`);
-const b = new WebSocket(`${BASE}?room=${room}`);
-const events = new Set();
-let snaps = 0;
+const DURATION = 20000;
+let grid = null;
+
+// 参加して init を受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
+function join() {
+  return new Promise((resolve, reject) => {
+    const c = { ws: new WebSocket(`${BASE}?room=${room}`), id: null, onSnap: null };
+    c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
+    c.ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.t === "init") { c.id = m.id; grid ??= makeGrid(m.map); resolve(c); }
+      else if (m.t === "s" && c.onSnap) c.onSnap(m);
+    };
+  });
+}
+const send = (c, m) => c.ws.readyState === 1 && c.ws.send(JSON.stringify({ t: "in", aim: 0, fire: false, ...m }));
+const view = (k) => ({ x: k.x, y: k.y, aim: k.a });
+
+const a = await join(); // チームA：撃つ側
+const b = await join(); // チームB：近づいて撃たれる側
+const c = await join(); // チームA：その場で待機（味方表示の確認用）
 const t0 = Date.now();
-const send = (ws, m) => ws.readyState === 1 && ws.send(JSON.stringify({ t: "in", aim: 0, fire: false, ...m }));
 
 // 確認項目の集計
-const stats = { moveSame: 0, moveDiff: 0 };
-let grid = null, aPrev = null;
-
-// 両者とも上部の通路へ移動 → Bは左へ接近 → Aが狙って撃つ
-a.onopen = () => send(a, { mx: 0, my: -1 });
-b.onopen = () => send(b, { mx: 0, my: -1 });
-let bTurned = false;
-b.onmessage = (e) => {
-  const m = JSON.parse(e.data);
-  if (m.t !== "s") return;
-  snaps++;
-  m.ev.forEach((x) => events.add(x.e));
-  if (!bTurned && Date.now() - t0 > 4000) { bTurned = true; send(b, { mx: -1, my: 0 }); }
+const events = new Set();
+let snaps = 0;
+const st = {
+  moveSame: 0, moveDiff: 0, // サーバーの移動と共有コードの一致
+  allyShown: 0, allyMissing: 0, // 味方が常に送られるか
+  earlyLeak: 0, // 開始直後（遠く離れている間）に敵が送られた回数
+  enemyOk: 0, enemyNg: 0, // 送られた敵が本当に視界内か
+  bulletOk: 0, bulletNg: 0, // Bに送られた（Aの）弾が視界内か
+  fireOk: 0, fireNg: 0, // Bに送られた発射イベントが視界内か（自チーム分を除く）
 };
-a.onmessage = (e) => {
-  const m = JSON.parse(e.data);
-  if (m.t === "init") { grid = makeGrid(m.map); return; }
-  if (m.t !== "s") return;
+const ratioOk = (ok, ng, min) => ok > 0 && ok / (ok + ng) >= min;
+
+// A・Bとも上部の通路へ移動 → Bは左へ接近 → Aは見えたら狙って撃つ
+send(a, { mx: 0, my: -1 });
+send(b, { mx: 0, my: -1 });
+let bTurned = false, aPrev = null;
+
+a.onSnap = (m) => {
   const el = Date.now() - t0;
-  const me = m.tanks.find((k) => k.team === "A");
+  const me = m.tanks.find((k) => k.id === a.id);
+  const en = m.tanks.find((k) => k.team !== me.team);
+  m.tanks.some((k) => k.id === c.id) ? st.allyShown++ : st.allyMissing++;
+  if (en) {
+    if (el < 2000) st.earlyLeak++;
+    canSeeTank(grid, view(me), en) ? st.enemyOk++ : st.enemyNg++;
+  }
 
   // サーバーの移動結果が共有の stepTank と一致するか（入力が上移動で一定の間だけ比べる）
-  if (aPrev && me && el > 500 && el < 3500) {
+  if (aPrev && el > 500 && el < 3500) {
     const pred = { x: aPrev.x, y: aPrev.y, body: 0 };
     stepTank(grid, pred, 0, -1, TICK_MS / 1000);
-    const same = Math.abs(pred.x - me.x) < 0.15 && Math.abs(pred.y - me.y) < 0.15;
-    same ? stats.moveSame++ : stats.moveDiff++;
+    Math.abs(pred.x - me.x) < 0.15 && Math.abs(pred.y - me.y) < 0.15 ? st.moveSame++ : st.moveDiff++;
   }
   aPrev = me;
 
   if (el < 4000) return;
-  const en = m.tanks.find((k) => k.team === "B");
-  if (me && en) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(en.y - me.y, en.x - me.x) * 100) / 100, fire: true });
+  if (en) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(en.y - me.y, en.x - me.x) * 100) / 100, fire: true });
+};
+
+b.onSnap = (m) => {
+  snaps++;
+  m.ev.forEach((x) => events.add(x.e));
+  const me = m.tanks.find((k) => k.id === b.id);
+  // Bに味方はいないので、届く弾はすべてAの弾。視界内のものだけのはず
+  for (const [x, y] of m.bullets) canSeePoint(grid, view(me), x, y) ? st.bulletOk++ : st.bulletNg++;
+  for (const e of m.ev) {
+    if (e.e === "fire") canSeePoint(grid, view(me), e.x, e.y) ? st.fireOk++ : st.fireNg++;
+  }
+  if (!bTurned && Date.now() - t0 > 4000) { bTurned = true; send(b, { mx: -1, my: 0 }); }
 };
 
 setTimeout(() => {
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
-    ["移動が共有コードと一致 ≥95%", stats.moveSame > 20 && stats.moveSame / (stats.moveSame + stats.moveDiff) >= 0.95,
-      `same=${stats.moveSame} diff=${stats.moveDiff}`],
+    ["移動が共有コードと一致 ≥95%", st.moveSame > 20 && ratioOk(st.moveSame, st.moveDiff, 0.95), `same=${st.moveSame} diff=${st.moveDiff}`],
+    ["味方は常に送られる", st.allyShown > 100 && st.allyMissing === 0, `shown=${st.allyShown} missing=${st.allyMissing}`],
+    ["離れている間は敵が送られない", st.earlyLeak === 0, `leak=${st.earlyLeak}`],
+    ["送られた敵は視界内 ≥95%", ratioOk(st.enemyOk, st.enemyNg, 0.95), `ok=${st.enemyOk} ng=${st.enemyNg}`],
+    ["送られた敵弾は視界内 ≥95%", ratioOk(st.bulletOk, st.bulletNg, 0.95), `ok=${st.bulletOk} ng=${st.bulletNg}`],
+    ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);
-  const ok = checks.every((c) => c[1]);
+  const ok = checks.every((x) => x[1]);
   console.log(ok ? "PASS" : "FAIL");
   process.exit(ok ? 0 : 1);
-}, 15000);
+}, DURATION);
