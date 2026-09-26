@@ -1,3 +1,4 @@
+import { updateGhosts, GHOST } from "./ghosts.js";
 import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
@@ -45,6 +46,9 @@ const fog = fogCv.getContext("2d");
 let ws = null, myId = null, map = [], grid = null;
 let points = []; // capture points {id, x, y, r} (conquest mode only; states come in each snapshot)
 const seenPins = new Set(); // pin ids already announced with a sound
+const ghosts = new Map(); // last-seen afterimages of enemies (see ghosts.js)
+let marks = []; // edge indicators: {kind: "hurt" | "shot", dir, d, at}
+const MARK = { hurtSec: 1.2, shotSec: 1.0 }; // how long edge indicators stay
 let prev = null, curr = null, currAt = 0;
 let audio = null;
 const keys = new Set();
@@ -122,9 +126,14 @@ function connect() {
     if (m.t === "init") {
       myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
       points = m.points || [];
+      ghosts.clear(); marks = [];
       pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
       if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
+      const nowSec = performance.now() / 1000;
+      updateGhosts(ghosts, curr, m, nowSec);
+      for (const dir of m.hurt) marks.push({ kind: "hurt", dir, at: nowSec });
+      for (const e of m.ev) if (e.e === "shot") marks.push({ kind: "shot", dir: e.dir, d: e.d, at: nowSec });
       for (const pin of m.pins) {
         if (seenPins.has(pin.id)) continue;
         seenPins.add(pin.id);
@@ -393,6 +402,42 @@ function drawPins() {
   }
 }
 
+// Enemies we saw a moment ago, faded at their last known position
+function drawGhosts() {
+  const now = performance.now() / 1000;
+  for (const g of ghosts.values()) {
+    ctx.globalAlpha = 0.4 * Math.max(0, 1 - (now - g.at) / GHOST.lifeSec);
+    drawTank(g.tank, false);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// Edge indicators around the viewpoint: red wedges for where hits came from,
+// pale ticks for unseen gunfire (bigger = closer). Directions are world angles
+function drawMarks(view) {
+  const now = performance.now() / 1000;
+  marks = marks.filter((m) => now - m.at < (m.kind === "hurt" ? MARK.hurtSec : MARK.shotSec));
+  if (!view) return;
+  const cx = view.x - cam.x, cy = view.y - cam.y;
+  for (const m of marks) {
+    const life = m.kind === "hurt" ? MARK.hurtSec : MARK.shotSec;
+    const dx = Math.cos(m.dir), dy = Math.sin(m.dir);
+    // Where the ray from the viewpoint leaves the screen (inset from the edges and the top bar)
+    const tx = dx > 0 ? (W - 8 - cx) / dx : dx < 0 ? (8 - cx) / dx : Infinity;
+    const ty = dy > 0 ? (H - 8 - cy) / dy : dy < 0 ? (20 - cy) / dy : Infinity;
+    const t = Math.max(0, Math.min(tx, ty));
+    const size = m.kind === "hurt" ? 7 : [6, 4, 3][m.d];
+    ctx.globalAlpha = Math.max(0, 1 - (now - m.at) / life);
+    ctx.fillStyle = m.kind === "hurt" ? "#ff3b3b" : "#e9e4d4";
+    ctx.save();
+    ctx.translate(cx + dx * t, cy + dy * t);
+    ctx.rotate(m.dir);
+    ctx.beginPath(); ctx.moveTo(size, 0); ctx.lineTo(-size, -size); ctx.lineTo(-size / 2, 0); ctx.lineTo(-size, size); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
 // Point letters are text, so they go on the high-resolution HUD layer
 function drawPointLabels() {
   hud.font = "8px DotGothic16, monospace";
@@ -512,8 +557,10 @@ function frame() {
   ctx.fillStyle = PALETTE.bullet;
   for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
   drawPoints();
+  drawGhosts();
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);
   drawPins();
+  drawMarks(view);
   drawPointLabels();
   drawHud(me);
   requestAnimationFrame(frame);
@@ -521,7 +568,24 @@ function frame() {
 requestAnimationFrame(frame);
 
 // ===== 効果音（Web Audio APIで合成） =====
-function tone(f1, f2, dur, type, vol) {
+const SOUND = {
+  hearDist: 260, // visible events fade out over this distance (px)
+  panDist: 160, // horizontal offset (px) at which a sound is fully left/right
+  hintVol: [0.8, 0.5, 0.3], // unseen gunfire volume by distance bucket (near, mid, far)
+};
+
+// Route a node to the speakers, panned left (-1) .. right (+1) where supported
+function output(node, pan) {
+  if (pan && audio.createStereoPanner) {
+    const p = audio.createStereoPanner();
+    p.pan.value = clamp(pan, -1, 1);
+    node.connect(p).connect(audio.destination);
+  } else {
+    node.connect(audio.destination);
+  }
+}
+
+function tone(f1, f2, dur, type, vol, pan = 0) {
   const t = audio.currentTime;
   const o = audio.createOscillator(), g = audio.createGain();
   o.type = type;
@@ -529,12 +593,12 @@ function tone(f1, f2, dur, type, vol) {
   o.frequency.exponentialRampToValueAtTime(f2, t + dur);
   g.gain.setValueAtTime(0.18 * vol, t);
   g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  o.connect(g).connect(audio.destination);
+  output(o.connect(g), pan);
   o.start(t);
   o.stop(t + dur);
 }
 
-function noise(dur, vol) {
+function noise(dur, vol, pan = 0) {
   const len = Math.floor(audio.sampleRate * dur);
   const buf = audio.createBuffer(1, len, audio.sampleRate);
   const d = buf.getChannelData(0);
@@ -542,7 +606,7 @@ function noise(dur, vol) {
   const src = audio.createBufferSource(), g = audio.createGain();
   src.buffer = buf;
   g.gain.value = 0.25 * vol;
-  src.connect(g).connect(audio.destination);
+  output(src.connect(g), pan);
   src.start();
 }
 
@@ -565,13 +629,19 @@ function playEvent(e) {
     else tone(500, 250, 0.3, "triangle", 0.7);
     return;
   }
-  // 音の距離は、いま見ている視点（自機、または観戦中の味方）から測る
+  // Unseen gunfire: only a rough direction and distance; a duller shot panned toward it
+  if (e.e === "shot") {
+    tone(520, 130, 0.12, "square", SOUND.hintVol[e.d], Math.cos(e.dir) * 0.9);
+    return;
+  }
+  // 音の距離は、いま見ている視点（自機、または観戦中の味方）から測る。左右は横方向のずれで振る
   const me = curr.tanks.find((k) => k.id === curr.view);
   const dist = me ? Math.hypot(me.x - e.x, me.y - e.y) : 0;
-  const vol = Math.max(0, 1 - dist / 260); // 遠いほど小さく
+  const vol = Math.max(0, 1 - dist / SOUND.hearDist); // 遠いほど小さく
+  const pan = me ? (e.x - me.x) / SOUND.panDist : 0;
   if (vol <= 0) return;
-  if (e.e === "fire") tone(880, 220, 0.08, "square", vol);
-  else if (e.e === "wall") tone(200, 80, 0.05, "square", vol * 0.5);
-  else if (e.e === "hit") noise(0.12, vol);
-  else if (e.e === "kill") { noise(0.45, vol); tone(300, 40, 0.4, "sawtooth", vol); }
+  if (e.e === "fire") tone(880, 220, 0.08, "square", vol, pan);
+  else if (e.e === "wall") tone(200, 80, 0.05, "square", vol * 0.5, pan);
+  else if (e.e === "hit") noise(0.12, vol, pan);
+  else if (e.e === "kill") { noise(0.45, vol, pan); tone(300, 40, 0.4, "sawtooth", vol, pan); }
 }

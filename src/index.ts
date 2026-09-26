@@ -34,6 +34,13 @@ const PIN = {
   lifeSec: 6, // a pin disappears after this
   cooldownSec: 1, // one pin per tank per second at most; a new pin replaces the tank's previous one
 };
+// Gunfire hints: an unseen enemy's shot is sent only as a rough direction and distance, never coordinates
+const HINT = {
+  range: 480, // shots farther than this from the viewpoint are not heard
+  sectors: 16, // direction is rounded to one of 16 sectors (22.5 deg)
+  near: 160, // distance buckets: 0 = within near, 1 = within mid, 2 = beyond
+  mid: 320,
+};
 type Mode = "elim" | "conquest";
 const MODE_DEFAULT: Mode = "elim";
 type Phase = "wait" | "countdown" | "play" | "roundEnd" | "matchEnd";
@@ -56,6 +63,7 @@ interface Tank {
   hp: number; dead: boolean; cooldown: number;
   respawnAt: number; // conquest only: time (s) to respawn after being destroyed
   pinAt: number; // when this tank last placed a pin
+  hurt: number[]; // directions (toward the shooter) of hits taken this tick, sent to the tank's own player
   input: Input;
   human: string | null; // 操作している接続のID
   bot: Bot | null;
@@ -211,7 +219,7 @@ export class Room extends DurableObject<Env> {
       for (let slot = 0; slot < TEAM_SIZE; slot++) {
         const t: Tank = {
           id: `${team}${slot}`, team, slot, type: BOT_TYPES[slot],
-          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0, respawnAt: 0, pinAt: -Infinity,
+          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0, respawnAt: 0, pinAt: -Infinity, hurt: [],
           input: { ...IDLE }, human: null, bot: null, hit: null,
         };
         t.bot = this.newBot(t);
@@ -517,6 +525,7 @@ export class Room extends DurableObject<Env> {
         if (Math.hypot(t.x - b.x, t.y - b.y) < tankSpec(t.type).r + 2) {
           t.hp = Math.max(0, t.hp - b.damage);
           t.hit = { dir: Math.atan2(-b.vy, -b.vx), at: now };
+          t.hurt.push(t.hit.dir);
           if (t.hp === 0) {
             t.dead = true; // 殲滅モードでは復活しない（次のラウンドで戻る）
             t.respawnAt = now + CONQUEST.respawnSec; // used only in conquest mode
@@ -535,6 +544,20 @@ export class Room extends DurableObject<Env> {
       try { c.ws.send(this.snapshotFor(c, now)); } catch { /* 切断済みは close イベントで処理 */ }
     }
     this.events = [];
+    for (const t of this.tanks) t.hurt = [];
+  }
+
+  // Unseen enemy shots heard from viewpoint v: rounded direction + distance bucket only
+  shotHints(v: Tank) {
+    const step = (Math.PI * 2) / HINT.sectors;
+    return this.events
+      .filter((e) => e.e === "fire" && e.team !== v.team && !canSeePoint(GRID, v, e.x, e.y))
+      .flatMap((e) => {
+        const d = Math.hypot(e.x - v.x, e.y - v.y);
+        if (d > HINT.range) return [];
+        const dir = r2(Math.round(Math.atan2(e.y - v.y, e.x - v.x) / step) * step);
+        return [{ e: "shot", dir, d: d < HINT.near ? 0 : d < HINT.mid ? 1 : 2 }];
+      });
   }
 
   // 視点にする戦車：自分の戦車が生きていればそれ。撃破中・観戦中は生きている味方（自チームの視点のみ）
@@ -577,10 +600,14 @@ export class Room extends DurableObject<Env> {
       bullets: this.bullets
         .filter((b) => b.team === v.team || seen(b.x, b.y))
         .map((b) => [Math.round(b.x), Math.round(b.y)]),
-      ev: this.events
-        .filter((e) => e.pub || e.team === v.team || seen(e.x, e.y))
-        // Public events keep their team (who captured); others drop it
-        .map(({ e, x, y, team, pub }) => (pub ? { e, x, y, team } : { e, x, y })),
+      ev: [
+        ...this.events
+          .filter((e) => e.pub || e.team === v.team || seen(e.x, e.y))
+          // Public events keep their team (who captured); others drop it
+          .map(({ e, x, y, team, pub }) => (pub ? { e, x, y, team } : { e, x, y })),
+        ...this.shotHints(v),
+      ],
+      hurt: c.tank ? c.tank.hurt.map(r2) : [], // own tank only: where this tick's hits came from
     });
   }
 }

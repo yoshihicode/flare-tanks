@@ -6,6 +6,7 @@ import {
   makeGrid, stepTank, canSeePoint, canSeeTank, lineOfSight, visibilityPolygon, isWall, angleDiff, tankSpec, TICK_MS, TILE,
 } from "../public/shared.js";
 import { botChecks } from "./bot-checks.mjs";
+import { updateGhosts, GHOST } from "../public/ghosts.js";
 
 const BASE = process.env.WS_URL || "ws://localhost:8787/ws";
 const room = "smoke-" + Date.now();
@@ -187,6 +188,22 @@ const conquestDone = (async () => {
   const r = await join("light", room4); // joins mid-match
   cstep("途中参加は即参加（bot と交代）", r.id !== null && g().ph === "play", `me=${r.id}`);
 
+  // Gunfire hints: q looks east, p is 200 px to the west (out of sight) and fires 5 shots northward
+  debug(q, { moveX: P.C.x, moveY: P.C.y });
+  send(q, { mx: 0, my: 0, aim: 0 });
+  debug(p, { moveX: P.C.x - 200, moveY: P.C.y });
+  await sleep(300);
+  const hintStart = qEvents.length;
+  send(p, { mx: 0, my: 0, aim: -Math.PI / 2, fire: true });
+  await sleep(2700);
+  send(p, { mx: 0, my: 0, aim: -Math.PI / 2, fire: false });
+  await sleep(200);
+  const hints = qEvents.slice(hintStart).filter((e) => e.e === "shot");
+  const leaked = qEvents.slice(hintStart).filter((e) => e.e === "fire");
+  cstep("見えない位置からの発砲は、向き（西）と距離「中」だけ届く",
+    hints.length >= 4 && leaked.length === 0 && hints.every((e) => Math.abs(angleDiff(e.dir, Math.PI)) < 0.01 && e.d === 1),
+    `hints=${hints.length} fire=${leaked.length} ${JSON.stringify(hints[0] ?? {})}`);
+
   debug(p, { score: { A: 499.5 } });
   cstep("先に500ptに届いたチームの勝ち", await until(() => g().ph === "matchEnd" && g().mr === "A"), `sc=${g().sc} mr=${g().mr}`);
   debug(p, { phaseSec: 0 });
@@ -230,6 +247,31 @@ for (let n = 0; n < 200; n++) {
   }
 }
 
+// Afterimages (client only): checked without the server
+const ghostChecks = (() => {
+  const en = (x, extra = {}) => ({ id: "B0", team: "B", k: "medium", x, y: 50, b: 0, a: 0, hp: 100, dead: false, ...extra });
+  const ally = { id: "A1", team: "A", k: "medium", x: 10, y: 10, b: 0, a: 0, hp: 100, dead: false };
+  const snap = (tanks, ev = []) => ({ team: "A", tanks, ev });
+  const g = new Map();
+  updateGhosts(g, snap([ally, en(100)]), snap([ally]), 0);
+  const left = g.get("B0")?.tank.x === 100 && !g.has("A1");
+  updateGhosts(g, snap([ally]), snap([ally, en(120)]), 1);
+  const reseen = !g.has("B0");
+  updateGhosts(g, snap([ally, en(120)]), snap([ally]), 2);
+  updateGhosts(g, snap([ally]), snap([ally]), 2 + GHOST.lifeSec + 0.1);
+  const expired = !g.has("B0");
+  updateGhosts(g, snap([ally, en(140)]), snap([ally]), 10);
+  updateGhosts(g, snap([ally]), snap([ally], [{ e: "kill", x: 141, y: 50 }]), 10.1);
+  const killed = !g.has("B0");
+  updateGhosts(g, snap([ally, en(160)]), snap([ally, en(160, { dead: true })].filter((k) => !k.dead)), 20);
+  return [
+    ["残像：見えなくなった敵を最後の位置に残す（味方は残さない）", left],
+    ["残像：再び見えたら消える", reseen],
+    [`残像：${GHOST.lifeSec}秒で消える`, expired],
+    ["残像：その場で撃破されたら消える", killed],
+  ].map(([n, ok]) => [n, ok, ""]);
+})();
+
 // 確認項目の集計
 const events = new Set();
 let snaps = 0;
@@ -241,6 +283,8 @@ const st = {
   bulletOk: 0, bulletNg: 0, // Bに送られた（Aの）弾が視界内か
   fireOk: 0, fireNg: 0, // Bに送られた発射イベントが視界内か（自チーム分を除く）
   lastAck: 0, rtts: [], // サーバーが返した確認番号と、そこから測った往復時間
+  hints: 0, hintBad: [], // unseen gunfire hints received by B, and any that break the rules
+  hurts: 0, hurtBad: [], // hit directions received by B, and any not pointing at A
   hpOk: 0, hpNg: 0, // 各戦車の初期HPが車種どおりか
   turnMax: 0, // Aの砲塔が1ティックで回った最大角度
 };
@@ -301,6 +345,24 @@ b.onSnap = (m) => {
   for (const e of m.ev) {
     if (e.e === "fire") canSeePoint(grid, view(me), e.x, e.y) ? st.fireOk++ : st.fireNg++;
   }
+  // Only A shoots, so hints and hit directions should point roughly at A (a.last is from about the same tick)
+  const shooter = a.last?.tanks.find((k) => k.id === a.id);
+  const toShooter = shooter && Math.atan2(shooter.y - me.y, shooter.x - me.x);
+  const sector = (Math.PI * 2) / 16;
+  for (const e of m.ev.filter((e) => e.e === "shot")) {
+    st.hints++;
+    const quantized = Math.abs(e.dir / sector - Math.round(e.dir / sector)) < 0.01;
+    const noCoords = !("x" in e) && !("y" in e);
+    const aimed = toShooter !== undefined && Math.abs(angleDiff(e.dir, toShooter)) < 0.5;
+    if (!quantized || !noCoords || ![0, 1, 2].includes(e.d) || !aimed) st.hintBad.push(JSON.stringify(e));
+  }
+  // Hit directions are about our own tank (the viewpoint switches to an ally on the tick we're destroyed)
+  const own = m.tanks.find((k) => k.id === m.me);
+  for (const dir of m.hurt) {
+    st.hurts++;
+    const toA = own && shooter && Math.atan2(shooter.y - own.y, shooter.x - own.x);
+    if (toA === undefined || Math.abs(angleDiff(dir, toA)) > 0.6) st.hurtBad.push(dir);
+  }
   if (!bTurned && Date.now() - t0 > 4000) { bTurned = true; send(b, { mx: -1, my: 0 }); }
 };
 
@@ -333,6 +395,10 @@ setTimeout(async () => {
     ["ピンは味方に届き、敵には届かない", pinIds.size > 0 && st.allyGotPin && !st.pinLeak, `ally=${!!st.allyGotPin} leak=${!!st.pinLeak}`],
     ["ピンの連打は制限される（1秒に1本）", pinIds.size === 1, `accepted=${pinIds.size}`],
     ["Lv5 の bot がピンで味方に知らせる", bots.botPins > 0, `botPins=${bots.botPins}`],
+    ["見えない敵の発砲は方向（16方向）と距離の段階だけ届く", st.hints > 0 && st.hintBad.length === 0,
+      `hints=${st.hints} bad=${st.hintBad.slice(0, 2).join(" ")}`],
+    ["被弾方向は撃った相手の方を向く", st.hurts > 0 && st.hurtBad.length === 0, `hurts=${st.hurts} bad=${st.hurtBad.length}`],
+    ...ghostChecks,
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);
