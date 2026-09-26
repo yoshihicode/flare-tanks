@@ -1,4 +1,5 @@
 import { updateGhosts, GHOST } from "./ghosts.js";
+import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "./touch.js";
 import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
@@ -316,19 +317,26 @@ rejoinBtn.addEventListener("click", busyButton(rejoinBtn, "接続中…", async 
 
 // Joining needs its own Turnstile token too (spec: check on create and join)
 async function enterRoom(id, adhoc = false) {
+  // Phones: go full screen in landscape where the browser allows it (must happen during the tap)
+  if (touchMode && document.documentElement.requestFullscreen && !document.fullscreenElement) {
+    document.documentElement.requestFullscreen().then(() => screen.orientation?.lock?.("landscape")).catch(() => {});
+  }
   const ts = await humanToken();
   lastRoom = { id, adhoc };
   showScreen("game");
   connect(id, adhoc, ts);
 }
 
-// Esc leaves the room and goes back to the lobby right away (without waiting for the close handshake)
-addEventListener("keydown", (e) => {
-  if (e.code !== "Escape" || !ws || overlay.style.display !== "none") return;
+// Esc (or the leave button) goes back to the lobby right away, without waiting for the close handshake
+function leaveRoom() {
+  if (!ws) return;
   const sock = ws;
   sock.onclose = null;
   sock.close(1000);
   roomClosed(1000, true);
+}
+addEventListener("keydown", (e) => {
+  if (e.code === "Escape" && ws && overlay.style.display === "none") leaveRoom();
 });
 
 function connect(roomId, adhoc, ts) {
@@ -432,12 +440,15 @@ function renderPlayers() {
     list.append(li);
   }
 }
-addEventListener("keydown", (e) => {
-  if (e.code !== "Tab" || overlay.style.display !== "none") return;
-  e.preventDefault();
+function togglePlayers() {
   const open = playersPanel.style.display !== "block";
   playersPanel.style.display = open ? "block" : "none";
   if (open) renderPlayers();
+}
+addEventListener("keydown", (e) => {
+  if (e.code !== "Tab" || overlay.style.display !== "none") return;
+  e.preventDefault();
+  togglePlayers();
 });
 
 // ===== 入力 =====
@@ -471,15 +482,79 @@ addEventListener("mouseup", (e) => { if (e.button === 0) mouse.down = false; });
 addEventListener("contextmenu", (e) => e.preventDefault());
 addEventListener("blur", () => { keys.clear(); mouse.down = false; });
 
-// 自機から見たマウスの方向（砲塔・視界の向き）
-function localAim(me) {
-  return me ? Math.atan2(mouse.y - (me.y - cam.y), mouse.x - (me.x - cam.x)) : 0;
+// ===== Touch: twin sticks (left half moves, right half aims; see touch.js) =====
+// Touch mode turns on for coarse pointers or at the first touch, and shows the on-screen buttons
+let touchMode = matchMedia("(pointer: coarse)").matches;
+const sticks = new Map(); // touch identifier -> {role: "move" | "aim", origin, point} in CSS px
+let touchAim = null; // last aim set with the right stick (kept when the thumb is lifted)
+const inGame = () => overlay.style.display === "none";
+function setTouchMode() {
+  if (!touchMode) return;
+  document.body.classList.add("touch");
+  if (titleView && !titleView.hidden) msg.textContent = "戦車をタップしてロビーへ";
 }
+setTouchMode();
+addEventListener("touchstart", (e) => {
+  if (!touchMode) { touchMode = true; setTouchMode(); }
+  if (!inGame() || e.target.closest("button, select, input, form, #players")) return;
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const role = t.clientX < innerWidth / 2 ? "move" : "aim";
+    if ([...sticks.values()].some((s) => s.role === role)) continue; // one stick per side
+    const p = { x: t.clientX, y: t.clientY };
+    sticks.set(t.identifier, { role, origin: p, point: p });
+  }
+}, { passive: false });
+addEventListener("touchmove", (e) => {
+  if (!inGame()) return;
+  e.preventDefault(); // no scrolling or zooming while playing
+  for (const t of e.changedTouches) {
+    const s = sticks.get(t.identifier);
+    if (s) s.point = { x: t.clientX, y: t.clientY };
+  }
+}, { passive: false });
+const endTouch = (e) => { for (const t of e.changedTouches) sticks.delete(t.identifier); };
+addEventListener("touchend", endTouch);
+addEventListener("touchcancel", endTouch);
+const stickOf = (role) => {
+  const s = [...sticks.values()].find((x) => x.role === role);
+  return s ? stickVector(s.origin, s.point) : null;
+};
+
+// 自機から見たマウスの方向（砲塔・視界の向き）。With touch, the right stick's direction (weak aim assist)
+function localAim(me) {
+  if (!me) return 0;
+  if (touchMode) {
+    const v = stickOf("aim");
+    const a = v && aimFromStick(v);
+    if (a?.active) {
+      const enemies = curr.tanks.filter((k) => k.team !== curr.team);
+      touchAim = assistAim(a.aim, me, enemies, tankSpec(me.k).range);
+    }
+    return touchAim ?? me.a;
+  }
+  return Math.atan2(mouse.y - (me.y - cam.y), mouse.x - (me.x - cam.x));
+}
+
+// Fire: mouse / space, or the right stick pushed far enough
+function fireInput() {
+  const v = touchMode && stickOf("aim");
+  return mouse.down || !!(v && aimFromStick(v).fire);
+}
+
+// Touch pin: on the nearest visible enemy, or a little ahead of the turret if none is in sight
+function touchPin(me) {
+  const enemies = curr.tanks.filter((k) => k.team !== curr.team && !k.dead);
+  const near = enemies.sort((a, b) => Math.hypot(a.x - me.x, a.y - me.y) - Math.hypot(b.x - me.x, b.y - me.y))[0];
+  const aim = me.a;
+  return near ? { x: near.x, y: near.y } : { x: me.x + Math.cos(aim) * TOUCH_PIN_AHEAD, y: me.y + Math.sin(aim) * TOUCH_PIN_AHEAD };
+}
+const TOUCH_PIN_AHEAD = 100; // px ahead of the turret for a pin with no enemy in sight
 
 function sendInput(aim) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const { mx, my } = moveInput();
-  const fire = mouse.down;
+  const fire = fireInput();
   // 変化したときだけ、最短50ms間隔で送る（無料枠の節約）
   const key = `${mx},${my},${Math.round(aim * 40)},${fire}`;
   const now = performance.now();
@@ -492,10 +567,51 @@ function sendInput(aim) {
 }
 
 function moveInput() {
+  const v = touchMode && stickOf("move");
+  if (v && v.mag >= STICK.deadZone) return moveFromStick(v);
   return {
     mx: (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0),
     my: (keys.has("down") ? 1 : 0) - (keys.has("up") ? 1 : 0),
   };
+}
+
+// Draw the sticks where the thumbs are (HUD layer, converted from CSS px to 320x180 units)
+function drawSticks() {
+  if (!sticks.size) return;
+  const r = cv.getBoundingClientRect();
+  const k = W / r.width;
+  for (const s of sticks.values()) {
+    const v = stickVector(s.origin, s.point);
+    const ox = (s.origin.x - r.left) * k, oy = (s.origin.y - r.top) * k, rad = STICK.radius * k;
+    hud.strokeStyle = "rgba(233, 228, 212, 0.35)";
+    hud.lineWidth = 1;
+    hud.beginPath(); hud.arc(ox, oy, rad, 0, Math.PI * 2); hud.stroke();
+    const firing = s.role === "aim" && v.mag >= STICK.fireAt;
+    hud.fillStyle = firing ? "rgba(255, 179, 71, 0.7)" : "rgba(233, 228, 212, 0.45)";
+    hud.beginPath(); hud.arc(ox + v.dx * rad, oy + v.dy * rad, rad * 0.4, 0, Math.PI * 2); hud.fill();
+  }
+}
+
+// ===== On-screen buttons for touch (top of the screen, clear of the thumbs) =====
+const touchBar = document.getElementById("touchBar");
+touchBar.addEventListener("click", (e) => {
+  const act = e.target.closest("button")?.dataset.act;
+  if (!act || !ws) return;
+  const me = curr?.tanks.find((k) => k.id === myId);
+  if (act === "pin" && me && !me.dead) ws.send(JSON.stringify({ t: "pin", ...roundPoint(touchPin(me)) }));
+  if (act === "start") ws.send(JSON.stringify({ t: "start" }));
+  if (act === "settings") touchSettingsOpen = !touchSettingsOpen;
+  if (act === "players") togglePlayers();
+  if (act === "leave") leaveRoom();
+});
+const roundPoint = (p) => ({ x: Math.round(p.x), y: Math.round(p.y) });
+let touchSettingsOpen = false; // on phones the owner's settings panel opens from the bar (it would cover the right stick)
+function syncTouchBar() {
+  touchBar.style.display = touchMode && inGame() ? "flex" : "none";
+  const ownerWaiting = !!(curr?.g.ph === "wait" && curr.g.owner);
+  touchBar.querySelector("[data-act=start]").hidden = !ownerWaiting;
+  touchBar.querySelector("[data-act=settings]").hidden = !ownerWaiting;
+  if (!ownerWaiting) touchSettingsOpen = false;
 }
 
 // 毎フレーム、現在の入力で自機を先に動かす（壁判定はサーバーと同じ stepTank）
@@ -658,7 +774,8 @@ settingsForm.addEventListener("change", () => {
 settingsForm.addEventListener("submit", (e) => e.preventDefault());
 // Keep the panel's visibility and values in sync with the server (skipping a field being edited)
 function syncSettingsPanel() {
-  const show = !!(curr && settings && curr.g.ph === "wait" && curr.g.owner && overlay.style.display === "none");
+  const show = !!(curr && settings && curr.g.ph === "wait" && curr.g.owner && overlay.style.display === "none")
+    && (!touchMode || touchSettingsOpen);
   settingsForm.style.display = show ? "block" : "none";
   if (!show) return;
   const f = settingsForm.elements;
@@ -830,7 +947,8 @@ function drawHud(me) {
   if (g.ph === "wait") {
     banner([
       `${MODE_NAME[g.mode]}　待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
-      g.owner ? "Enter キーで今すぐ開始　／　ウォームアップ中は撃てません" : "部屋主の開始を待っています　／　ウォームアップ中は撃てません",
+      (g.owner ? (touchMode ? "「今すぐ開始」ボタンで開始" : "Enter キーで今すぐ開始") : "部屋主の開始を待っています")
+        + "　／　ウォームアップ中は撃てません",
       (settings ? settingsText(settings) : "") + (inviteCode ? `　招待コード ${inviteCode}（Tab）` : ""),
     ], false, H - 26); // 自機に重ならないよう画面下に出す
   } else if (g.ph === "countdown") {
@@ -880,6 +998,7 @@ function frame() {
   const target = localAim(me);
   if (me && pred) me.a = pred.aim = turnTurret(pred.type, pred.aim, target, dt);
   if (me && !me.dead) sendInput(target);
+  else touchAim = null;
   drawMap();
   drawFog(view, view ? view.a : 0);
   ctx.fillStyle = PALETTE.bullet;
@@ -892,7 +1011,9 @@ function frame() {
   drawPointLabels();
   drawNames(tanks);
   drawHud(me);
+  drawSticks();
   syncSettingsPanel();
+  syncTouchBar();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

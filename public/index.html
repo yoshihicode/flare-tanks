@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>FLARE TANKS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -24,9 +24,35 @@
     #overlay {
       position: absolute; inset: 0;
       display: flex; flex-direction: column; align-items: center; justify-content: center;
-      gap: 1.25rem; background: rgba(18, 26, 20, 0.88); cursor: pointer;
-      text-align: center; padding: 1rem;
+      gap: 1.25rem; background: rgba(18, 26, 20, 0.88);
+      text-align: center; padding: 1rem; overflow-y: auto;
     }
+    /* Short landscape phones: start from the top and scroll instead of clipping the lobby */
+    @media (max-height: 480px) {
+      #overlay { justify-content: flex-start; gap: 0.7rem; padding: 0.6rem 1rem; }
+      #overlay h1 { font-size: 2.2rem; }
+      #rooms { max-height: none; }
+    }
+    /* Touch: no text selection, callouts or double-tap zoom while playing */
+    body.touch { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+    #c, #hud { touch-action: none; }
+    .touch-only { display: none; }
+    body.touch .touch-only { display: revert; }
+    body.touch .mouse-only { display: none; }
+    /* On-screen buttons for touch, at the top so thumbs don't cover them (spec: pin button up top) */
+    #touchBar {
+      position: absolute; top: calc(env(safe-area-inset-top) + 2.2rem); left: 50%; transform: translateX(-50%);
+      display: none; gap: 0.5rem;
+    }
+    #touchBar .btn { padding: 0.45rem 0.9rem; background: rgba(10, 14, 11, 0.75); }
+    /* On phones the settings panel sits below the button bar */
+    body.touch #settings { top: calc(env(safe-area-inset-top) + 5.2rem); }
+    /* Landscape only: ask to rotate a phone held upright */
+    #rotate {
+      position: fixed; inset: 0; display: none; z-index: 10; background: var(--night); color: var(--flare);
+      align-items: center; justify-content: center; text-align: center; font-size: 1.3rem; padding: 2rem;
+    }
+    @media (orientation: portrait) { body.touch #rotate { display: flex; } }
     #overlay h1 {
       margin: 0; font-weight: 400; font-size: clamp(2.5rem, 9vw, 5rem);
       color: var(--flare); letter-spacing: 0.08em;
@@ -125,7 +151,8 @@
       <div id="tanks" role="group" aria-label="戦車の選択"></div>
       <div id="err" role="alert"></div>
       <div id="msg">戦車を選んでロビーへ（1・2・3キーで選択、Enter で決定）</div>
-      <div id="help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン　Tab で参加者一覧　Esc で部屋を出る</div>
+      <div id="help" class="mouse-only">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン　Tab で参加者一覧　Esc で部屋を出る</div>
+      <div id="helpTouch" class="touch-only">左半分をなぞって移動　右半分をなぞって照準（大きく倒すと自動で射撃）　上のボタンでピン</div>
     </section>
     <section id="lobby" hidden aria-label="ロビー">
       <div id="lobbyMsg" role="status"></div>
@@ -151,6 +178,14 @@
       <div class="row"><button class="btn" id="back" type="button">名前・戦車を変える</button></div>
     </section>
   </div>
+  <div id="touchBar" role="toolbar" aria-label="操作ボタン">
+    <button class="btn" type="button" data-act="pin">ピン</button>
+    <button class="btn primary" type="button" data-act="start" hidden>今すぐ開始</button>
+    <button class="btn" type="button" data-act="settings" hidden>設定</button>
+    <button class="btn" type="button" data-act="players">参加者</button>
+    <button class="btn" type="button" data-act="leave">退出</button>
+  </div>
+  <div id="rotate" role="alert">横向きにしてください<br>（このゲームは横画面で遊びます）</div>
   <div id="players" aria-label="参加者一覧">
     <h2>参加者</h2>
     <div id="invite"></div>

@@ -7,6 +7,7 @@ import {
 } from "../public/shared.js";
 import { botChecks } from "./bot-checks.mjs";
 import { updateGhosts, GHOST } from "../public/ghosts.js";
+import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "../public/touch.js";
 import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
 import { LOBBY, pickQuick, expired, newCode, rateLimited, overBudget, publicList } from "../src/lobby.ts";
 import { DEFAULT_SETTINGS } from "../src/settings.ts";
@@ -23,7 +24,10 @@ async function guest(name, token) {
   return { status: res.status, body: await res.json() };
 }
 const room = "smoke-" + Date.now();
-const DURATION = 20000;
+// The main scenario runs until B is destroyed (at least MIN_MS, at most MAX_MS): under load the server
+// ticks slower and B takes longer to reach A, so a fixed duration made the test flaky
+const MIN_MS = 20000;
+const MAX_MS = 40000;
 let grid = null;
 
 // 参加して最初のスナップショットを受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
@@ -64,9 +68,10 @@ const until = (cond, ms = 5000) => new Promise((resolve) => {
 // 待機中の部屋をすぐ対戦に進める（部屋主が開始 → カウントダウンを飛ばす）
 async function startNow(owner) {
   owner.ws.send(JSON.stringify({ t: "start" }));
-  await until(() => owner.last.g.ph === "countdown", 2000);
+  const counted = await until(() => owner.last.g.ph === "countdown", 2000);
   debug(owner, { phaseSec: 0 });
-  await until(() => owner.last.g.ph === "play", 2000);
+  const playing = await until(() => owner.last.g.ph === "play", 2000);
+  return `${counted ? "countdown" : "no-countdown"}/${playing ? "play" : owner.last.g.ph}`;
 }
 // 入力には確認番号 q を付ける（クライアントの予測補正と同じ形式）
 const send = (c, m) => {
@@ -81,7 +86,7 @@ const a = await join("medium"); // チームA：撃つ側
 debug(a, { freezeBots: true });
 const b = await join("medium"); // チームB：近づいて撃たれる側
 const c = await join("light"); // チームA：少し下へ動いて待機（味方表示・軽戦車の確認用）
-await startNow(a);
+const startedOk = await startNow(a);
 const t0 = Date.now();
 
 // ===== 別の部屋：bot の巡回と、切断した戦車の引き継ぎ =====
@@ -241,7 +246,8 @@ const botCapture = { owned: null };
 const botCaptureDone = (async () => {
   const x = await join("medium", room + "-botcap", "&mode=conquest&bot=3"); // idle human; the other 5 are bots
   await startNow(x);
-  const got = await until(() => x.last.g.pts.some((p) => p.o), 15000);
+  // Bots may fight or ambush on the way, so allow some time (walk ~4 s + capture 5 s when unhindered)
+  const got = await until(() => x.last.g.pts.some((p) => p.o), 25000);
   botCapture.owned = got ? x.last.g.pts.filter((p) => p.o).map((p) => `${p.id}:${p.o}`).join(",") : null;
 })();
 
@@ -555,6 +561,26 @@ const ghostChecks = (() => {
   ].map(([n, ok]) => [n, ok, ""]);
 })();
 
+// Touch controls (public/touch.js), checked without a browser
+const touchChecks = (() => {
+  const o = { x: 100, y: 100 };
+  const at = (dx, dy) => stickVector(o, { x: o.x + dx, y: o.y + dy });
+  const mv = (dx, dy) => { const m = moveFromStick(at(dx, dy)); return `${m.mx},${m.my}`; };
+  const me = { x: 0, y: 0 };
+  const enemy = (deg) => ({ x: Math.cos((deg * Math.PI) / 180) * 100, y: Math.sin((deg * Math.PI) / 180) * 100, dead: false });
+  const deg = (r) => Math.round((r * 180) / Math.PI);
+  return [
+    ["スティック：遊びの範囲は無視し、8方向に丸める（WASD と同じ入力）",
+      mv(5, 5) === "0,0" && mv(50, 0) === "1,0" && mv(-40, -38) === "-1,-1" && mv(10, 50) === "0,1", ""],
+    ["スティック：半径より先は1に丸め、大きく倒すと自動射撃",
+      at(500, 0).mag === 1 && aimFromStick(at(STICK.radius, 0)).fire && !aimFromStick(at(STICK.radius * 0.5, 0)).fire
+        && !aimFromStick(at(3, 0)).active, ""],
+    ["照準補助：近くの角度の敵にだけ少し寄せる（見えている敵のみ）",
+      deg(assistAim(0, me, [enemy(10)], 200)) === 5 && deg(assistAim(0, me, [enemy(30)], 200)) === 0
+        && deg(assistAim(0, me, [enemy(10)], 50)) === 0, `${deg(assistAim(0, me, [enemy(10)], 200))}°`],
+  ].map(([n, ok, d]) => [n, ok, d]);
+})();
+
 // 確認項目の集計
 const events = new Set();
 let snaps = 0;
@@ -614,7 +640,10 @@ a.onSnap = (m) => {
   if (el < 4000) return;
   const target = m.tanks.find((k) => k.id === b.id);
   if (target) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(target.y - me.y, target.x - me.x) * 100) / 100, fire: true });
+  // After the turret test A faces west; look back east along the corridor where B comes from
+  else if (!aLookedBack) { aLookedBack = true; send(a, { mx: 0, my: 0, aim: 0 }); }
 };
+let aLookedBack = false;
 
 c.onSnap = (m) => { if (m.pins.some((p) => p.by === a.id)) st.allyGotPin = true; };
 b.onSnap = (m) => {
@@ -646,10 +675,19 @@ b.onSnap = (m) => {
     const toA = own && shooter && Math.atan2(shooter.y - own.y, shooter.x - own.x);
     if (toA === undefined || Math.abs(angleDiff(dir, toA)) > 0.6) st.hurtBad.push(dir);
   }
-  if (!bTurned && Date.now() - t0 > 4000) { bTurned = true; send(b, { mx: -1, my: 0 }); }
+  // Turn toward A once B has reached the top corridor (by position, not by time: ticks may run slower under load)
+  const bSelf = m.tanks.find((k) => k.id === b.id);
+  if (!bTurned && bSelf && !bSelf.dead && bSelf.y < 2 * TILE && Date.now() - t0 > 4000) {
+    bTurned = true;
+    send(b, { mx: -1, my: 0 });
+  }
 };
 
-setTimeout(async () => {
+(async () => {
+  await sleep(MIN_MS);
+  await until(() => events.has("kill"), MAX_MS - MIN_MS);
+  await sleep(500); // let the last hit/kill snapshots arrive
+  const elapsed = (Date.now() - t0) / 1000;
   await flowDone;
   await conquestDone;
   await botCaptureDone;
@@ -657,8 +695,9 @@ setTimeout(async () => {
   await guestDone;
   await lobbyDone;
   const checks = [
-    ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
-    ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
+    ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}（${(snaps / elapsed).toFixed(1)}回/秒、${elapsed.toFixed(0)}秒）`],
+    ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)),
+      `events=${[...events].join(",")} start=${startedOk} ph=${a.last.g.ph} A=${JSON.stringify(a.last.tanks.find((k) => k.id === a.id))} B=${JSON.stringify(b.last.tanks.find((k) => k.id === b.id))}`],
     ["両チームとも3台（空き枠は bot）", st.teamA === 3 && st.teamB === 3, `A=${st.teamA} B=${st.teamB}`],
     ["bot が巡回で動く", bots.moved > 0, `moved=${bots.moved}`],
     ["bot が敵を見つけて撃つ（Lv5の部屋）", bots.fires > 0, `fire=${bots.fires}`],
@@ -689,10 +728,11 @@ setTimeout(async () => {
       `hints=${st.hints} bad=${st.hintBad.slice(0, 2).join(" ")}`],
     ["被弾方向は撃った相手の方を向く", st.hurts > 0 && st.hurtBad.length === 0, `hurts=${st.hurts} bad=${st.hurtBad.length}`],
     ...ghostChecks,
+    ...touchChecks,
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);
   const ok = checks.every((x) => x[1]);
   console.log(ok ? "PASS" : "FAIL");
   process.exit(ok ? 0 : 1);
-}, DURATION);
+})();
