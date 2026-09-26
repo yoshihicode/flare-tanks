@@ -97,10 +97,13 @@
     #settings select, #settings input { font: inherit; color: var(--ash); background: #1b2419; border: 1px solid #4a483e; }
     /* One setting per row: label on the left, a fixed-width control on the right, with space between rows */
     #createForm label, #settings label {
-      display: grid; grid-template-columns: 1fr 8.5rem; align-items: center; column-gap: 1rem;
+      display: grid; grid-template-columns: 1fr 11rem; align-items: center; column-gap: 1rem;
       margin: 0.4rem 0; line-height: 1.4;
     }
-    #createForm select, #settings select { width: 100%; padding: 0.15rem 0.3rem; }
+    #createForm select, #settings select, #createForm input[type="number"], #settings input[type="number"] {
+      width: 100%; padding: 0.15rem 0.3rem; box-sizing: border-box; font: inherit; color: var(--ash);
+      background: #1b2419; border: 1px solid #4a483e; text-align: left; letter-spacing: normal;
+    }
     #createForm input[type="checkbox"], #settings input[type="checkbox"] { justify-self: start; width: 1.1rem; height: 1.1rem; margin: 0; }
     #settings select:focus-visible, #settings input:focus-visible { outline: 2px solid var(--flare); }
     /* Buttons and inputs in the title / lobby screens */
@@ -177,6 +180,8 @@
       <form id="createForm" hidden aria-label="部屋を作る">
         <label>モード <select name="mode"><option value="elim">殲滅</option><option value="conquest">拠点制圧</option></select></label>
         <label>先取ラウンド（殲滅） <select name="winRounds"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+        <label>マップ <select name="map"><option value="random" selected>自動生成（128×128）</option><option value="basic">標準（40×24）</option></select></label>
+        <label>シード値（空欄はおまかせ） <input name="mapSeed" type="number" min="0" max="2147483647" inputmode="numeric" placeholder="おまかせ"></label>
         <label>bot の強さ <select name="botLevel"><option value="1">1 入門</option><option value="2">2 初級</option><option value="3" selected>3 標準</option><option value="4">4 上級</option><option value="5">5 達人</option></select></label>
         <label>フレンドリーファイア <input type="checkbox" name="ff"></label>
         <label>公開（一覧に表示する） <input type="checkbox" name="public" checked></label>
@@ -207,6 +212,10 @@
       <select name="mode"><option value="elim">殲滅</option><option value="conquest">拠点制圧</option></select></label>
     <label>先取ラウンド（殲滅）
       <select name="winRounds"><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
+    <label>マップ
+      <select name="map"><option value="random">自動生成（128×128）</option><option value="basic">標準（40×24）</option></select></label>
+    <label>シード値（空欄で新しいマップ）
+      <input name="mapSeed" type="number" min="0" max="2147483647" inputmode="numeric" placeholder="おまかせ"></label>
     <label>bot の強さ
       <select name="botLevel"><option value="1">1 入門</option><option value="2">2 初級</option><option value="3">3 標準</option><option value="4">4 上級</option><option value="5">5 達人</option></select></label>
     <label>フレンドリーファイア <input type="checkbox" name="ff"></label>

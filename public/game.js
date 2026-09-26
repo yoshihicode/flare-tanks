@@ -1,7 +1,7 @@
 import { updateGhosts, GHOST } from "./ghosts.js";
 import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "./touch.js";
 import { INTERP, sample, pushSnapshot } from "./interp.js";
-import { MINIMAP, minimapLayout, minimapDots } from "./minimap.js";
+import { MINIMAP, minimapLayout, minimapDots, minimapWalls } from "./minimap.js";
 import { SFX, FIRE_SFX, synth } from "./sfx.js";
 import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
@@ -252,7 +252,7 @@ function renderRooms(rooms) {
     const li = document.createElement("li");
     const info = document.createElement("div");
     const rule = r.mode === "elim" ? `殲滅・${r.winRounds}ラウンド先取` : "拠点制圧";
-    info.innerHTML = `<div>${rule}</div><div class="meta">${r.humans}/${r.capacity}人・${r.playing ? "対戦中" : "待機中"}・bot Lv${r.botLevel}・FF${r.ff ? "あり" : "なし"}</div>`;
+    info.innerHTML = `<div>${rule}・${mapText(r)}</div><div class="meta">${r.humans}/${r.capacity}人・${r.playing ? "対戦中" : "待機中"}・bot Lv${r.botLevel}・FF${r.ff ? "あり" : "なし"}</div>`;
     const btn = document.createElement("button");
     btn.className = "btn";
     btn.type = "button";
@@ -310,6 +310,7 @@ const createRoom = busyButton(createForm.querySelector("button[type=submit]"), "
   const settings = {
     mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value),
     ff: f.ff.checked, public: f.public.checked,
+    map: f.map.value, mapSeed: f.mapSeed.value === "" ? null : Number(f.mapSeed.value),
   };
   const { id } = await api("/api/rooms", { settings, ts: await humanToken() });
   createForm.hidden = true;
@@ -357,6 +358,16 @@ addEventListener("keydown", (e) => {
   if (e.code === "Escape" && ws && overlay.style.display === "none") leaveRoom();
 });
 
+// A new map (joining, or the owner changed it): rebuild everything derived from the tiles
+function setMap(tiles) {
+  map = tiles;
+  grid = makeGrid(map);
+  snapBuffer = [];
+  buildMinimap();
+  pred = null; history = [];
+  ghosts.clear();
+}
+
 function connect(roomId, adhoc, ts) {
   const params = new URLSearchParams(location.search);
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -370,16 +381,16 @@ function connect(roomId, adhoc, ts) {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
-      myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
-      snapBuffer = [];
-      buildMinimap();
-      pred = null; history = []; sentAt.clear();
+      myId = null; prev = curr = null;
+      setMap(m.map);
+      sentAt.clear();
       points = m.points || [];
       settings = m.settings;
       inviteCode = m.code;
       ghosts.clear(); marks = [];
     } else if (m.t === "cfg") {
       settings = m.settings; points = m.points || [];
+      if (m.map) setMap(m.map); // the owner switched maps while waiting
     } else if (m.t === "players") {
       players = m.players;
       renderPlayers();
@@ -691,14 +702,14 @@ function buildMinimap() {
   mmLayout = minimapLayout(map[0].length, map.length);
   mmCv.width = Math.ceil(mmLayout.w);
   mmCv.height = Math.ceil(mmLayout.h);
-  mm.fillStyle = "rgba(10, 14, 11, 0.75)";
-  mm.fillRect(0, 0, mmCv.width, mmCv.height);
-  mm.fillStyle = "rgba(143, 139, 120, 0.9)";
-  for (let ty = 0; ty < map.length; ty++) {
-    for (let tx = 0; tx < map[0].length; tx++) {
-      if (map[ty][tx] === "#") mm.fillRect(tx * mmLayout.scale, ty * mmLayout.scale, Math.ceil(mmLayout.scale), Math.ceil(mmLayout.scale));
-    }
+  // Background, then each pixel shaded by how much of it is wall
+  const img = mm.createImageData(mmCv.width, mmCv.height);
+  const cover = minimapWalls(map, mmLayout);
+  for (let i = 0; i < cover.length; i++) {
+    const k = Math.min(1, cover[i] * 1.3);
+    img.data.set([10 + (143 - 10) * k, 14 + (139 - 14) * k, 11 + (120 - 11) * k, 200], i * 4);
   }
+  mm.putImageData(img, 0, 0);
 }
 function drawMinimap() {
   if (!mmLayout) return;
@@ -825,7 +836,10 @@ const MODE_NAME = { elim: "殲滅モード", conquest: "拠点制圧モード" }
 const settingsForm = document.getElementById("settings");
 settingsForm.addEventListener("change", () => {
   const f = settingsForm.elements;
-  const next = { mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value), ff: f.ff.checked };
+  const next = {
+    mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value), ff: f.ff.checked,
+    map: f.map.value, mapSeed: f.mapSeed.value === "" ? null : Number(f.mapSeed.value), // empty = a new random map
+  };
   ws?.send(JSON.stringify({ t: "settings", settings: next }));
 });
 settingsForm.addEventListener("submit", (e) => e.preventDefault());
@@ -839,11 +853,12 @@ function syncSettingsPanel() {
   for (const [name, value] of Object.entries(settings)) {
     const el = f[name];
     if (!el || el === document.activeElement) continue;
-    if (el.type === "checkbox") el.checked = value; else el.value = String(value);
+    if (el.type === "checkbox") el.checked = value; else el.value = value === null ? "" : String(value);
   }
 }
+const mapText = (s) => (s.map === "random" ? `自動生成マップ（シード ${s.mapSeed ?? "おまかせ"}）` : "標準マップ");
 const settingsText = (s) =>
-  `${s.mode === "elim" ? `${s.winRounds}ラウンド先取` : `${curr.g.tg}pt先取`}・bot Lv${s.botLevel}・フレンドリーファイア${s.ff ? "あり" : "なし"}`;
+  `${mapText(s)}・${s.mode === "elim" ? `${s.winRounds}ラウンド先取` : `${curr.g.tg}pt先取`}・bot Lv${s.botLevel}・FF${s.ff ? "あり" : "なし"}`;
 const ownerColor = (o) => (o ? PALETTE[o] : "#8a8778");
 
 // Capture zones: ring in the owner's color, arc = capture progress of the leading team.

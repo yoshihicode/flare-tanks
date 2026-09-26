@@ -9,6 +9,8 @@ import { DEFAULT_SETTINGS, parseSettings, settingsFromQuery, type RoomSettings }
 import { GUEST, checkName, newGuestId, signToken, uniqueName, verifyToken } from "./guest.ts";
 import type { Env } from "./env.ts";
 import { basicMap, type GameMap } from "./maps.ts";
+import { generateMap } from "./mapgen.ts";
+import { SETTING_LIMITS } from "./settings.ts";
 import { verifyTurnstile } from "./turnstile.ts";
 export { Lobby } from "./lobby-do.ts";
 
@@ -283,8 +285,10 @@ export class Room extends DurableObject<Env> {
   }
 
   // Settings and the capture points they imply; sent in init and whenever the owner changes settings
-  config() {
+  // (with the tiles too when the map itself changed)
+  config(withMap = false) {
     return {
+      ...(withMap ? { map: this.world.tiles } : {}),
       settings: this.settings,
       points: this.mode === "conquest" ? this.world.points.map((p) => ({ ...p, r: CONQUEST.radius })) : [],
     };
@@ -477,19 +481,43 @@ export class Room extends DurableObject<Env> {
     if (p && (m.own.team === "A" || m.own.team === "B")) { p.owner = m.own.team; p.cap = m.own.team === "A" ? 1 : -1; }
   }
 
-  // The map for the current settings. For now always the basic map; generated maps come next (step 7)
+  // The map for the current settings. A generated map without a seed gets one here, written back into
+  // the settings so everyone can see it and the same map can be made again
   loadMap() {
-    this.world = basicMap();
+    if (this.settings.map === "random") {
+      const seed = this.settings.mapSeed ?? Math.floor(Math.random() * SETTING_LIMITS.maxSeed);
+      this.settings = { ...this.settings, mapSeed: seed };
+      try {
+        this.world = generateMap(seed);
+      } catch {
+        // No valid candidate for this seed (very unlikely): play on the basic map rather than fail the room
+        this.settings = { ...this.settings, map: "basic", mapSeed: null };
+        this.world = basicMap();
+      }
+    } else {
+      this.world = basicMap();
+    }
     this.grid = makeGrid(this.world.tiles);
   }
 
   applySettings(next: RoomSettings) {
+    const mapChanged = next.map !== this.settings.map || (next.map === "random" && next.mapSeed !== this.settings.mapSeed);
     const modeChanged = next.mode !== this.settings.mode;
     const levelChanged = next.botLevel !== this.settings.botLevel;
     this.settings = next;
-    if (modeChanged) this.resetPoints();
-    if (levelChanged) for (const t of this.tanks) if (t.bot) t.bot = this.newBot(t);
-    const msg = JSON.stringify({ t: "cfg", ...this.config() });
+    if (mapChanged) {
+      // New map: everyone back to their spawn on it; bots need the new grid
+      this.loadMap();
+      this.bullets = [];
+      this.pins = { A: [], B: [] };
+      for (const t of this.tanks) {
+        this.spawn(t);
+        if (t.bot) t.bot = this.newBot(t);
+      }
+    }
+    if (modeChanged || mapChanged) this.resetPoints();
+    if (levelChanged && !mapChanged) for (const t of this.tanks) if (t.bot) t.bot = this.newBot(t);
+    const msg = JSON.stringify({ t: "cfg", ...this.config(mapChanged) });
     for (const c of this.clients.values()) {
       try { c.ws.send(msg); } catch { /* closed sockets are handled by the close event */ }
     }

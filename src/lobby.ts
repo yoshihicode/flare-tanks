@@ -44,6 +44,7 @@ export function publicList(rooms: RoomEntry[]) {
       id: r.id, humans: r.humans, capacity: LOBBY.capacity,
       playing: !(r.phase === "wait" || r.phase === "countdown"),
       mode: r.settings.mode, winRounds: r.settings.winRounds, botLevel: r.settings.botLevel, ff: r.settings.ff,
+      map: r.settings.map, mapSeed: r.settings.mapSeed,
     }));
 }
 

@@ -9,7 +9,7 @@ import { botChecks } from "./bot-checks.mjs";
 import { updateGhosts, GHOST } from "../public/ghosts.js";
 import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "../public/touch.js";
 import { sample, pushSnapshot, INTERP } from "../public/interp.js";
-import { minimapLayout, minimapDots, MINIMAP } from "../public/minimap.js";
+import { minimapLayout, minimapDots, minimapWalls, MINIMAP } from "../public/minimap.js";
 import { readFileSync } from "node:fs";
 import { SFX, FIRE_SFX, synth } from "../public/sfx.js";
 import { generateMap, assemble, validate, disjointPaths, GEN } from "../src/mapgen.ts";
@@ -52,7 +52,7 @@ async function join(tank, roomName = room, extra = "", who = {}) {
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.t === "init") { grid ??= makeGrid(m.map); c.init = m; c.settings = m.settings; }
-      else if (m.t === "cfg") { c.settings = m.settings; c.points = m.points; }
+      else if (m.t === "cfg") { c.settings = m.settings; c.points = m.points; if (m.map) c.map = m.map; }
       else if (m.t === "players") c.players = m.players;
       else if (m.t === "s") {
         c.id = m.me; // 観戦中は null
@@ -316,6 +316,45 @@ const settingsDone = (async () => {
   sstep("フレンドリーファイアなしなら味方に当たらない", off.lost === 0, `ally lost ${off.lost}hp`);
 })();
 
+// ===== Another room: generated maps in a real room (seed, reproducibility, switching maps while waiting) =====
+const mapRoom = [];
+const mstep = (name, ok, detail = "") => mapRoom.push([name, ok, detail]);
+const mapRoomDone = (async () => {
+  const room8 = room + "-map";
+  const p = await join("medium", room8, "&map=random&seed=777&mode=conquest"); // A, owner
+  const q = await join("medium", room8); // B
+  const want = generateMap(777);
+  const mine = p.last.tanks.find((k) => k.id === p.id);
+  const slot = Number(p.id.slice(1));
+  mstep("自動生成マップの部屋：シードどおりのマップ・拠点・出撃位置が使われる",
+    p.init.map.length === 128 && p.init.map.join("") === want.tiles.join("") && p.settings.mapSeed === 777
+      && JSON.stringify(p.init.points.map(({ id, x, y }) => [id, x, y])) === JSON.stringify(want.points.map(({ id, x, y }) => [id, x, y]))
+      && Math.hypot(mine.x - want.spawns.A[slot].x, mine.y - want.spawns.A[slot].y) < 1,
+    `rows=${p.init.map.length} seed=${p.settings.mapSeed} me=(${mine.x},${mine.y})`);
+  const set = (c, settings) => c.ws.send(JSON.stringify({ t: "settings", settings }));
+  set(q, { mapSeed: 5 });
+  set(p, { mapSeed: -5 });
+  set(p, { mapSeed: 2 ** 31 });
+  await sleep(400);
+  mstep("シード値は部屋主だけが変えられ、範囲外の値は無視", p.settings.mapSeed === 777 && !p.map, `seed=${p.settings.mapSeed}`);
+  set(p, { ...p.settings, mapSeed: 4242 });
+  const switched = await until(() => p.map && q.map && p.settings.mapSeed === 4242);
+  const next = generateMap(4242);
+  await sleep(200);
+  const moved = p.last.tanks.find((k) => k.id === p.id);
+  mstep("待機中にシードを変えると全員に新しいマップが届き、出撃位置に戻る",
+    switched && p.map.join("") === next.tiles.join("") && q.map.join("") === next.tiles.join("")
+      && Math.hypot(moved.x - next.spawns.A[slot].x, moved.y - next.spawns.A[slot].y) < 1
+      && p.points?.every((pt, i) => pt.x === next.points[i].x), `seed=${p.settings.mapSeed}`);
+  set(p, { ...p.settings, mapSeed: null });
+  await until(() => p.settings.mapSeed !== 4242 && p.settings.mapSeed !== null);
+  mstep("シード値を空にすると、部屋が新しいシードを決めて設定に書き込む",
+    Number.isInteger(p.settings.mapSeed) && p.settings.mapSeed !== 4242 && p.map.join("") === generateMap(p.settings.mapSeed).tiles.join(""),
+    `seed=${p.settings.mapSeed}`);
+  p.ws.close();
+  q.ws.close();
+})();
+
 // Try to join and report how it ended: "ok" (got a snapshot) or the close code
 async function tryJoin(roomName, who = {}) {
   const token = who.token ?? (await guest("x")).body.token;
@@ -364,6 +403,11 @@ const lobbyDone = (async () => {
   lstep("招待コードで非公開部屋が見つかる（不正なコードは400）", byCode.body.id === priv.id && badCode.status === 400);
 
   const p = await join("medium", pub.id, "", { name: "Owner", lobby: true });
+  const dflt = (await api("/api/rooms", { settings: { public: false } })).body;
+  const d = await join("medium", dflt.id, "", { lobby: true });
+  lstep("ロビーで作る部屋の既定は自動生成マップ（シードは部屋が決める）",
+    d.settings.map === "random" && Number.isInteger(d.settings.mapSeed) && d.init.map.length === 128, `map=${d.settings.map} seed=${d.settings.mapSeed}`);
+  d.ws.close();
   lstep("ロビーで作った部屋に入ると設定と招待コードが届く",
     p.settings.mode === "conquest" && p.settings.botLevel === 2 && p.init.code === pub.code, JSON.stringify(p.settings));
   lstep("入ると一覧の人数が増える", await until(() => listed(pub.id)?.humans === 1), JSON.stringify(listed(pub.id)));
@@ -599,6 +643,12 @@ const clientChecks = (() => {
   const late = sample(buf, 2000);
   for (let i = 0; i < INTERP.keep + 5; i++) pushSnapshot(buf, snap([]), 3000 + i);
   const layout = minimapLayout(40, 24);
+  const big = minimapLayout(128, 128);
+  // Stripes of wall / floor columns shade to about half; all wall = 1, all floor = 0
+  const stripes = Array.from({ length: 128 }, () => Array.from({ length: 128 }, (_, x) => (x % 2 ? "#" : ".")).join(""));
+  const half = minimapWalls(stripes, big);
+  const full = minimapWalls(Array(128).fill("#".repeat(128)), big);
+  const empty = minimapWalls(Array(128).fill(".".repeat(128)), big);
   const ghosts = new Map([["B5", { tank: tk("B5", 7), at: 0 }]]);
   const dots = minimapDots(snap([{ ...tk("A0", 1), team: "A" }, tk("B0", 2), tk("B9", 3, { dead: true })]), ghosts);
   return [
@@ -607,7 +657,10 @@ const clientChecks = (() => {
       JSON.stringify(mid.tanks.map((k) => [k.id, k.x]))],
     ["補間：最新より先は先読みせず最新のまま、古いものは捨てる",
       late.tanks.find((k) => k.id === "B0")?.x === 30 && buf.length === INTERP.keep, ""],
-    ["ミニマップ：画面上部の枠に収まる大きさ", layout.w <= MINIMAP.maxW && layout.h <= MINIMAP.maxH && layout.w > 50, `${layout.w.toFixed(0)}x${layout.h.toFixed(0)}`],
+    ["ミニマップ：画面上部の枠に収まる大きさ（40×24・128×128）", layout.w <= MINIMAP.maxW && layout.h <= MINIMAP.maxH && layout.w > 50
+      && big.w <= MINIMAP.maxW && big.h <= MINIMAP.maxH && big.h >= 40, `${layout.w.toFixed(0)}x${layout.h.toFixed(0)} / ${big.w.toFixed(0)}x${big.h.toFixed(0)}`],
+    ["ミニマップ：大きいマップは壁の割合で濃淡を付けて縮小する", Math.abs(half[0] - 0.5) < 0.2 && full[0] === 1 && empty[0] === 0,
+      `${half[0].toFixed(2)}`],
     ["ミニマップ：味方・見えている敵・残像だけ（撃破された戦車は出さない）",
       dots.map((d) => `${d.kind}:${d.x}`).join() === "ally:1,enemy:2,ghost:7" && dots[0].me, JSON.stringify(dots.map((d) => d.kind))],
   ];
@@ -847,6 +900,7 @@ b.onSnap = (m) => {
   await settingsDone;
   await guestDone;
   await lobbyDone;
+  await mapRoomDone;
   await pwaDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}（${(snaps / elapsed).toFixed(1)}回/秒、${elapsed.toFixed(0)}秒）`],
@@ -861,6 +915,7 @@ b.onSnap = (m) => {
     ...setting,
     ...guestChecks,
     ...lobbyChecks,
+    ...mapRoom,
     ...lobbyLogic,
     ["拠点制圧：bot が自分で拠点を取る", botCapture.owned !== null, `owned=${botCapture.owned}`],
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
