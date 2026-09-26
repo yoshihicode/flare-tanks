@@ -45,16 +45,17 @@ export async function verifyToken(secret: string, token: unknown): Promise<strin
   return safeEqual(await hmac(secret, body), parts[3]) ? parts[1] : null;
 }
 
-// Normalize and check a display name. Returns {name} or {error} (error text is shown to the player)
-export function checkName(input: unknown): { name: string } | { error: string } {
-  if (typeof input !== "string") return { error: "名前を入力してください" };
+// Normalize and check a display name. Returns {name}, or {error} with an error code (see src/errors.ts)
+// and, for the length limit, {max}
+export function checkName(input: unknown): { name: string } | { error: "name_required" | "name_too_long" | "name_blocked"; max?: number } {
+  if (typeof input !== "string") return { error: "name_required" };
   // Drop control characters, collapse whitespace, trim
   const name = input.normalize("NFC").replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e]/g, "")
     .replace(/\s+/g, " ").trim();
-  if (!name) return { error: "名前を入力してください" };
-  if ([...name].length > GUEST.nameMax) return { error: `名前は${GUEST.nameMax}文字までです` };
+  if (!name) return { error: "name_required" };
+  if ([...name].length > GUEST.nameMax) return { error: "name_too_long", max: GUEST.nameMax };
   const lower = name.toLowerCase();
-  if (GUEST.ngWords.some((w) => lower.includes(w.toLowerCase()))) return { error: "その名前は使えません" };
+  if (GUEST.ngWords.some((w) => lower.includes(w.toLowerCase()))) return { error: "name_blocked" };
   return { name };
 }
 

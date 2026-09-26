@@ -104,6 +104,7 @@ export const STRINGS = {
     "err.code_not_found": "招待コードの部屋が見つかりません",
     "err.budget": "本日の利用上限に近いため、新しい部屋は作れません（日本時間9:00に再開します）",
     "err.rate_limited": "部屋を作りすぎです。しばらく待ってからもう一度お試しください",
+    "err.not_found": "見つかりません",
 
     "team.A": "Aチーム", "team.B": "Bチーム",
     "result.win": "勝利", "result.lose": "敗北", "result.draw": "引き分け",
@@ -231,6 +232,7 @@ export const STRINGS = {
     "err.code_not_found": "No room with that invite code",
     "err.budget": "Today's usage limit is nearly reached, so no new rooms can be created (resets at 00:00 UTC)",
     "err.rate_limited": "Too many rooms created. Please wait a while and try again",
+    "err.not_found": "Not found",
 
     "team.A": "Team A", "team.B": "Team B",
     "result.win": "Victory", "result.lose": "Defeat", "result.draw": "Draw",

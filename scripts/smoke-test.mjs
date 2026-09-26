@@ -13,6 +13,7 @@ import { minimapLayout, minimapDots, minimapWalls, MINIMAP } from "../public/min
 import { readFileSync } from "node:fs";
 import { SFX, FIRE_SFX, synth } from "../public/sfx.js";
 import { STRINGS, LANGS, t as tr, setLang, detectLang } from "../public/i18n.js";
+import { ERRORS } from "../src/errors.ts";
 import { generateMap, assemble, validate, disjointPaths, GEN } from "../src/mapgen.ts";
 import { RANDOM_CHUNKS, BASE_CHUNK, POINT_CHUNK, PLAZA_CHUNK, CHUNK, transform } from "../src/chunks.ts";
 import vm from "node:vm";
@@ -396,12 +397,12 @@ const lobbyDone = (async () => {
   const listed = (id) => lists.at(-1)?.rooms.find((r) => r.id === id);
 
   const unauth = await fetch(`${HTTP}/api/rooms`, { method: "POST", body: JSON.stringify({ token: "bad", ts: TS }) });
-  lstep("トークンなしでは部屋を作れない", unauth.status === 401, `status=${unauth.status}`);
+  lstep("トークンなしでは部屋を作れない", unauth.status === 401 && (await unauth.json()).code === "guest_invalid", `status=${unauth.status}`);
   const config = await (await fetch(`${HTTP}/api/config`)).json();
   lstep("Turnstile のサイトキーを配る", typeof config.turnstileSiteKey === "string" && config.turnstileSiteKey.length > 0);
   const noTs = await api("/api/rooms", { ts: "" });
   const noTsQuick = await api("/api/quick", { ts: undefined });
-  lstep("Turnstile の確認なしでは部屋を作れない（クイック参加も）", noTs.status === 403 && noTsQuick.status === 403,
+  lstep("Turnstile の確認なしでは部屋を作れない（クイック参加も）", noTs.status === 403 && noTsQuick.status === 403 && noTs.body.code === "human_check",
     `${noTs.status}/${noTsQuick.status}`);
   const pub = (await api("/api/rooms", { settings: { mode: "conquest", botLevel: 2, public: true } })).body;
   lstep("公開部屋を作ると一覧に配信される", await until(() => listed(pub.id)?.mode === "conquest" && listed(pub.id)?.humans === 0),
@@ -411,7 +412,9 @@ const lobbyDone = (async () => {
   lstep("非公開部屋は一覧に出ない（6桁の招待コードが付く）", /^\d{6}$/.test(priv.code) && !listed(priv.id), `code=${priv.code}`);
   const byCode = await api("/api/code", { code: priv.code });
   const badCode = await api("/api/code", { code: "12ab" });
-  lstep("招待コードで非公開部屋が見つかる（不正なコードは400）", byCode.body.id === priv.id && badCode.status === 400);
+  const noRoom = await api("/api/code", { code: "000001" });
+  lstep("招待コードで非公開部屋が見つかる（不正なコードは400、ない部屋は404）", byCode.body.id === priv.id && badCode.status === 400
+    && badCode.body.code === "code_format" && (noRoom.status === 404 ? noRoom.body.code === "code_not_found" : noRoom.status === 200));
 
   const p = await join("medium", pub.id, "", { name: "Owner", lobby: true });
   const dflt = (await api("/api/rooms", { settings: { public: false } })).body;
@@ -457,9 +460,14 @@ const lobbyDone = (async () => {
   // Per-IP creation limit (a fresh fake IP so earlier creations in this run don't count)
   const ip2 = TEST_IP + "-limit";
   const statuses = [];
-  for (let i = 0; i <= LOBBY.createLimit; i++) statuses.push((await api("/api/rooms", { settings: { public: false } }, ip2)).status);
+  let lastLimited = null;
+  for (let i = 0; i <= LOBBY.createLimit; i++) {
+    const r = await api("/api/rooms", { settings: { public: false } }, ip2);
+    statuses.push(r.status);
+    lastLimited = r.body;
+  }
   lstep(`同じ接続元からの部屋作成は${LOBBY.createWindowSec / 60}分に${LOBBY.createLimit}回まで`,
-    statuses.slice(0, -1).every((x) => x === 200) && statuses.at(-1) === 429, statuses.join(","));
+    statuses.slice(0, -1).every((x) => x === 200) && statuses.at(-1) === 429 && lastLimited?.code === "rate_limited", statuses.join(","));
 
   // Rooms report incoming message counts to the lobby's daily total
   const post = (path, body) => fetch(`${HTTP}${path}`, { method: "POST", body: JSON.stringify(body) });
@@ -480,7 +488,8 @@ const lobbyDone = (async () => {
   const over = await api("/api/rooms", { settings: { public: false } }, ip2 + "-b");
   await post("/api/debug/usage", { value: 0 });
   const after = await api("/api/rooms", { settings: { public: false } }, ip2 + "-b");
-  lstep("受信メッセージが1日の上限に近いと新しい部屋を作れない", over.status === 503 && after.status === 200, `${over.status} -> ${after.status}`);
+  lstep("受信メッセージが1日の上限に近いと新しい部屋を作れない", over.status === 503 && over.body.code === "budget" && after.status === 200,
+    `${over.status} -> ${after.status}`);
 })();
 
 // Lobby rules without the server
@@ -531,6 +540,9 @@ const guestDone = (async () => {
   const first = await guest("Yoshi");
   const again = await guest("Yoshi2", first.body.token);
   const forged = await guest("Yoshi", tampered);
+  const blocked = await guest("admin");
+  gstep("API：名前のエラーはコードで返る（翻訳はクライアント）",
+    bad.body.code === "name_too_long" && bad.body.max === 12 && blocked.body.code === "name_blocked", `${bad.body.code}/${blocked.body.code}`);
   gstep("API：不正な名前は400、正しいトークンは同じゲストIDのまま名前だけ変わる",
     bad.status === 400 && first.status === 200 && again.body.gid === first.body.gid && again.body.name === "Yoshi2"
       && forged.body.gid !== first.body.gid, `bad=${bad.status} gid kept=${again.body.gid === first.body.gid}`);
@@ -797,6 +809,8 @@ const i18nChecks = (() => {
     ["多言語：英語の文に日本語が混じらない", !jpInEn.length, jpInEn.join(",")],
     ["多言語：game.js と index.html が使うキーはすべて辞書にある", !missing.length && literal.length > 40, `used=${literal.length} missing=${missing.join(",")}`],
     ["多言語：index.html にキーの付いていない日本語がない", !untagged.length, untagged.slice(0, 3).join(" ")],
+    ["多言語：サーバーのすべてのエラーコードに両言語の訳がある", Object.keys(ERRORS).every((c) => `err.${c}` in ja && `err.${c}` in en),
+      Object.keys(ERRORS).filter((c) => !(`err.${c}` in ja)).join(",")],
     ["多言語：ブラウザの言語から判定（日本語以外は英語）", detectLang(["ja-JP", "en"]) === "ja" && detectLang(["en-US", "ja"]) === "en"
       && detectLang(["fr-FR"]) === "en" && detectLang(["fr", "ja"]) === "ja" && detectLang([]) === "en", ""],
     ["多言語：差し込み値の埋め込みと、キーがないときの扱い", filled === "2/6 players" && fallback === "no.such.key", filled],

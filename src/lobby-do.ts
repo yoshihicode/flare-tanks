@@ -4,6 +4,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env.ts";
 import { DEFAULT_SETTINGS, parseSettings } from "./settings.ts";
+import { fail } from "./errors.ts";
 import {
   LOBBY, dayKey, expired, newCode, newRoomId, overBudget, pickQuick, publicList, rateLimited, type RoomEntry,
 } from "./lobby.ts";
@@ -43,11 +44,11 @@ export class Lobby extends DurableObject<Env> {
       case "/code": {
         const code = url.searchParams.get("code") ?? "";
         const room = (await this.rooms()).find((r) => r.code === code);
-        return room ? json({ id: room.id, code: room.code }) : json({ error: "招待コードの部屋が見つかりません" }, 404);
+        return room ? json({ id: room.id, code: room.code }) : fail("code_not_found", 404);
       }
       case "/update": await this.update(body); return json({ ok: true });
     }
-    return json({ error: "not found" }, 404);
+    return fail("not_found", 404);
   }
 
   async rooms(): Promise<RoomEntry[]> {
@@ -58,11 +59,11 @@ export class Lobby extends DurableObject<Env> {
   async guardedCreate(settings: typeof DEFAULT_SETTINGS, ip: unknown) {
     const used = (await this.ctx.storage.get<number>(`msgs:${dayKey(Date.now())}`)) ?? 0;
     if (overBudget(used)) {
-      return json({ error: "本日の利用上限に近いため、新しい部屋は作れません（日本時間9:00に再開します）" }, 503);
+      return fail("budget", 503);
     }
     const key = `ip:${typeof ip === "string" ? ip : "unknown"}`;
     const times = rateLimited((await this.ctx.storage.get<number[]>(key)) ?? [], Date.now() / 1000);
-    if (!times) return json({ error: "部屋を作りすぎです。しばらく待ってからもう一度お試しください" }, 429);
+    if (!times) return fail("rate_limited", 429);
     await this.ctx.storage.put(key, times);
     return json(await this.create(settings));
   }

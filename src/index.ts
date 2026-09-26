@@ -12,6 +12,7 @@ import { basicMap, type GameMap } from "./maps.ts";
 import { generateMap } from "./mapgen.ts";
 import { SETTING_LIMITS } from "./settings.ts";
 import { verifyTurnstile } from "./turnstile.ts";
+import { fail } from "./errors.ts";
 export { Lobby } from "./lobby-do.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
@@ -110,7 +111,7 @@ export default {
     // Refuse to run without secrets rather than fall back to guessable or disabled defaults
     const needsSetup = url.pathname === "/ws" || url.pathname === "/lobby" || url.pathname.startsWith("/api/");
     if (needsSetup && (!env.GUEST_SECRET || !env.TURNSTILE_SECRET || !env.TURNSTILE_SITEKEY)) {
-      return new Response("サーバーの設定が未完了です（GUEST_SECRET / TURNSTILE_SECRET / TURNSTILE_SITEKEY）", { status: 500 });
+      return new Response("Server not configured: set GUEST_SECRET, TURNSTILE_SECRET and TURNSTILE_SITEKEY", { status: 500 });
     }
     const secret = env.GUEST_SECRET!;
     const debug = env.DEBUG_TOOLS === "1";
@@ -124,11 +125,11 @@ export default {
     // Issue (or renew) a guest token: {name, token?} -> {token, gid, name}. A valid token keeps its guest ID
     if (url.pathname === "/api/guest" && req.method === "POST") {
       const body = await req.text();
-      if (body.length > 1000) return json({ error: "リクエストが大きすぎます" }, 413);
+      if (body.length > 1000) return fail("too_large", 413);
       let m: any;
-      try { m = JSON.parse(body); } catch { return json({ error: "不正なリクエストです" }, 400); }
+      try { m = JSON.parse(body); } catch { return fail("bad_request", 400); }
       const checked = checkName(m?.name);
-      if ("error" in checked) return json({ error: checked.error }, 400);
+      if ("error" in checked) return fail(checked.error, 400, checked.max ? { max: checked.max } : {});
       const gid = (await verifyToken(secret, m?.token)) ?? newGuestId();
       return json({ token: await signToken(secret, gid), gid, name: checked.name });
     }
@@ -139,19 +140,19 @@ export default {
 
     // Room list watchers (WebSocket, pushed on change) and room actions. All need a valid guest token
     if (url.pathname === "/lobby") {
-      if (req.headers.get("Upgrade") !== "websocket") return new Response("WebSocket接続が必要です", { status: 426 });
-      if (!(await verifyToken(secret, url.searchParams.get("token")))) return new Response("ゲストの確認に失敗しました", { status: 401 });
+      if (req.headers.get("Upgrade") !== "websocket") return new Response("WebSocket upgrade required", { status: 426 });
+      if (!(await verifyToken(secret, url.searchParams.get("token")))) return fail("guest_invalid", 401);
       return lobby.fetch(req);
     }
     if (url.pathname === "/api/rooms" || url.pathname === "/api/quick" || url.pathname === "/api/code") {
-      if (req.method !== "POST") return json({ error: "POSTで送ってください" }, 405);
+      if (req.method !== "POST") return fail("method", 405);
       const m: any = await req.json().catch(() => null);
-      if (!(await verifyToken(secret, m?.token))) return json({ error: "ゲストの確認に失敗しました" }, 401);
+      if (!(await verifyToken(secret, m?.token))) return fail("guest_invalid", 401);
       // Creating (and quick join, which may create) needs a Turnstile pass; code lookup doesn't join by itself
-      if (url.pathname !== "/api/code" && !(await human(m?.ts))) return json({ error: "自動プログラム対策の確認に失敗しました。もう一度お試しください" }, 403);
+      if (url.pathname !== "/api/code" && !(await human(m?.ts))) return fail("human_check", 403);
       if (url.pathname === "/api/rooms") return toLobby("/create", { settings: m.settings, ip: ip ?? "unknown" });
       if (url.pathname === "/api/quick") return toLobby("/quick", { ip: ip ?? "unknown" });
-      if (!/^\d{6}$/.test(String(m.code))) return json({ error: "招待コードは6桁の数字です" }, 400);
+      if (!/^\d{6}$/.test(String(m.code))) return fail("code_format", 400);
       return lobby.fetch(`https://lobby/code?code=${m.code}`);
     }
 
@@ -162,12 +163,12 @@ export default {
 
     if (url.pathname === "/ws") {
       if (req.headers.get("Upgrade") !== "websocket") {
-        return new Response("WebSocket接続が必要です", { status: 426 });
+        return new Response("WebSocket upgrade required", { status: 426 });
       }
       const gid = await verifyToken(secret, url.searchParams.get("token"));
       const checked = checkName(url.searchParams.get("name"));
-      if (!gid || "error" in checked) return new Response("ゲストの確認に失敗しました", { status: 401 });
-      if (!(await human(url.searchParams.get("ts")))) return new Response("自動プログラム対策の確認に失敗しました", { status: 403 });
+      if (!gid || "error" in checked) return fail("guest_invalid", 401);
+      if (!(await human(url.searchParams.get("ts")))) return fail("human_check", 403);
       const room = (url.searchParams.get("room") || "default").slice(0, 32);
       const stub = env.ROOM.get(env.ROOM.idFromName(room));
       // The room trusts these headers: rooms are reachable only through this Worker
@@ -223,7 +224,7 @@ export class Room extends DurableObject<Env> {
     }
     const gid = req.headers.get("X-Guest-Id");
     const baseName = decodeURIComponent(req.headers.get("X-Guest-Name") || "");
-    if (!gid || !baseName) return new Response("ゲストの確認に失敗しました", { status: 401 });
+    if (!gid || !baseName) return fail("guest_invalid", 401);
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
@@ -236,8 +237,9 @@ export class Room extends DurableObject<Env> {
     // Rooms are created through the lobby. Ad-hoc rooms (?room=name&adhoc=1) exist only in dev for tests
     this.setup ??= (await this.ctx.storage.get<RoomSetup>("setup")) ?? null;
     const adhoc = this.env.DEBUG_TOOLS === "1" && url.searchParams.get("adhoc") === "1";
-    if (!this.setup && !adhoc) return reject(4404, "部屋が見つかりません");
-    if (this.banned.has(gid)) return reject(4005, "この部屋からは追放されています");
+    // Close codes (the client shows its own text for each; see close.<code> in public/i18n.js)
+    if (!this.setup && !adhoc) return reject(4404, "room not found");
+    if (this.banned.has(gid)) return reject(4005, "kicked from this room");
     // 最初の1人が来たときに6枠を bot で用意する
     if (!this.tanks.length) this.setupRoom(this.setup ? parseSettings(this.setup.settings) : settingsFromQuery(url.searchParams));
     const now = Date.now() / 1000;
@@ -249,13 +251,13 @@ export class Room extends DurableObject<Env> {
     if (c) {
       const old = c.ws;
       c.ws = server;
-      try { old.close(4000, "別の画面で接続しました"); } catch { /* already closed */ }
+      try { old.close(4000, "joined from another screen"); } catch { /* already closed */ }
     } else {
       // A tank held for this guest after a recent disconnect is given back, even mid-round
       const held = this.reserved.get(gid);
       const tank = held && held.until > now ? this.tanks.find((t) => t.id === held.tankId && !t.human) : undefined;
       const team = tank ? tank.team : this.pickTeam();
-      if (!team) return reject(4003, "満員です");
+      if (!team) return reject(4003, "room full");
       const taken = new Set([...this.clients.values()].map((x) => x.name));
       c = { id: crypto.randomUUID().slice(0, 8), ws: server, team, type, gid, name: uniqueName(baseName, taken), tank: null, seq: 0 };
       this.clients.set(c.id, c);
@@ -416,7 +418,7 @@ export class Room extends DurableObject<Env> {
     const ws = target.ws;
     this.leave(target);
     this.reserved.delete(target.gid); // leave() holds the tank for reconnects; not for a kicked player
-    try { ws.close(4005, "部屋主に追放されました"); } catch { /* already closed */ }
+    try { ws.close(4005, "kicked by the owner"); } catch { /* already closed */ }
   }
 
   spawn(t: Tank) {
