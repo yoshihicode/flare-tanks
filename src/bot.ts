@@ -70,34 +70,65 @@ const BOT = {
 };
 
 // ===== 経路探索（タイル上のA*、上下左右の4方向） =====
+// The open list is a binary heap: generated maps are 128x128 tiles, where a linear scan is far too slow
 export function findPath(g: Grid, from: Tile, to: Tile): Tile[] | null {
   if (isWallTile(g, to[0], to[1])) return null;
+  const size = g.w * g.h;
   const key = (x: number, y: number) => y * g.w + x;
-  const h = (x: number, y: number) => Math.abs(x - to[0]) + Math.abs(y - to[1]);
-  const open: { x: number; y: number; f: number }[] = [{ x: from[0], y: from[1], f: h(from[0], from[1]) }];
-  const cost = new Map<number, number>([[key(from[0], from[1]), 0]]);
-  const came = new Map<number, number>();
-  while (open.length) {
-    // マップが小さいので、ヒープではなく最小値の線形探索で十分
-    let bi = 0;
-    for (let i = 1; i < open.length; i++) if (open[i].f < open[bi].f) bi = i;
-    const cur = open.splice(bi, 1)[0];
-    if (cur.x === to[0] && cur.y === to[1]) {
-      const path: Tile[] = [];
-      for (let k: number | undefined = key(cur.x, cur.y); k !== undefined; k = came.get(k)) {
-        path.push([k % g.w, Math.floor(k / g.w)]);
+  const h = (k: number) => Math.abs((k % g.w) - to[0]) + Math.abs(Math.floor(k / g.w) - to[1]);
+  const cost = new Float64Array(size).fill(Infinity);
+  const came = new Int32Array(size).fill(-1);
+  const heap: number[] = []; // node keys ordered by f = cost + heuristic
+  const f = new Float64Array(size);
+  const push = (k: number) => {
+    heap.push(k);
+    for (let i = heap.length - 1; i > 0;) {
+      const up = (i - 1) >> 1;
+      if (f[heap[up]] <= f[heap[i]]) break;
+      [heap[up], heap[i]] = [heap[i], heap[up]];
+      i = up;
+    }
+  };
+  const pop = () => {
+    const top = heap[0], last = heap.pop()!;
+    if (heap.length) {
+      heap[0] = last;
+      for (let i = 0; ;) {
+        const l = i * 2 + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && f[heap[l]] < f[heap[m]]) m = l;
+        if (r < heap.length && f[heap[r]] < f[heap[m]]) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]];
+        i = m;
       }
+    }
+    return top;
+  };
+  const start = key(from[0], from[1]), goal = key(to[0], to[1]);
+  cost[start] = 0;
+  f[start] = h(start);
+  push(start);
+  const done = new Uint8Array(size);
+  while (heap.length) {
+    const cur = pop();
+    if (done[cur]) continue; // stale heap entry
+    done[cur] = 1;
+    if (cur === goal) {
+      const path: Tile[] = [];
+      for (let k = cur; k !== -1; k = came[k]) path.push([k % g.w, Math.floor(k / g.w)]);
       return path.reverse();
     }
-    const c = cost.get(key(cur.x, cur.y))!;
+    const cx = cur % g.w, cy = Math.floor(cur / g.w);
     for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const nx = cur.x + dx, ny = cur.y + dy;
+      const nx = cx + dx, ny = cy + dy;
       if (isWallTile(g, nx, ny)) continue;
       const nk = key(nx, ny);
-      if (cost.has(nk) && cost.get(nk)! <= c + 1) continue;
-      cost.set(nk, c + 1);
-      came.set(nk, key(cur.x, cur.y));
-      open.push({ x: nx, y: ny, f: c + 1 + h(nx, ny) });
+      if (cost[cur] + 1 >= cost[nk]) continue;
+      cost[nk] = cost[cur] + 1;
+      came[nk] = cur;
+      f[nk] = cost[nk] + h(nk);
+      push(nk);
     }
   }
   return null;

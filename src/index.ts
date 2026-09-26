@@ -8,6 +8,7 @@ import { Bot, type Pin } from "./bot.ts";
 import { DEFAULT_SETTINGS, parseSettings, settingsFromQuery, type RoomSettings } from "./settings.ts";
 import { GUEST, checkName, newGuestId, signToken, uniqueName, verifyToken } from "./guest.ts";
 import type { Env } from "./env.ts";
+import { basicMap, type GameMap } from "./maps.ts";
 import { verifyTurnstile } from "./turnstile.ts";
 export { Lobby } from "./lobby-do.ts";
 
@@ -90,52 +91,7 @@ interface GameEvent { e: "fire" | "hit" | "kill" | "wall" | "cap"; x: number; y:
 interface CapturePoint { id: string; x: number; y: number; cap: number; owner: Team | null; contested: boolean }
 
 
-// ===== マップ（40×24タイル、点対称） =====
-const MAP = buildMap();
-const MAP_W = MAP[0].length;
-const MAP_H = MAP.length;
-const GRID = makeGrid(MAP);
-
-function buildMap(): string[] {
-  const W = 40, H = 24;
-  const g = Array.from({ length: H }, (_, y) =>
-    Array.from({ length: W }, (_, x) => (x === 0 || y === 0 || x === W - 1 || y === H - 1 ? "#" : ".")),
-  );
-  // [x, y, 幅, 高さ]。180°回転した位置にも同じ壁を置く
-  const rects = [[6, 4, 2, 6], [12, 10, 6, 2], [18, 3, 2, 5], [8, 16, 4, 2], [16, 15, 2, 4]];
-  for (const [rx, ry, rw, rh] of rects) {
-    for (let y = ry; y < ry + rh; y++) {
-      for (let x = rx; x < rx + rw; x++) {
-        g[y][x] = "#";
-        g[H - 1 - y][W - 1 - x] = "#";
-      }
-    }
-  }
-  return g.map((r) => r.join(""));
-}
-
-const isWall = (px: number, py: number): boolean => isWallAt(GRID, px, py);
-
 interface RoomSetup { id: string; code: string; settings: unknown }
-
-// Capture point markers are part of the map data (ignored in elimination mode).
-// C sits at the map center; A (team A side) and B are point-symmetric about it
-const POINTS = (() => {
-  const cx = (MAP_W * TILE) / 2, cy = (MAP_H * TILE) / 2;
-  const a = { x: 12.5 * TILE, y: 5.5 * TILE };
-  return [
-    { id: "A", x: a.x, y: a.y },
-    { id: "B", x: 2 * cx - a.x, y: 2 * cy - a.y },
-    { id: "C", x: cx, y: cy },
-  ];
-})();
-
-function spawnPoint(team: Team, i: number) {
-  const tx = 3, ty = 10 + i * 2;
-  const x = team === "A" ? tx : MAP_W - 1 - tx;
-  const y = team === "A" ? ty : MAP_H - 1 - ty;
-  return { x: x * TILE + TILE / 2, y: y * TILE + TILE / 2, body: team === "A" ? 0 : Math.PI };
-}
 
 const dir = (v: unknown) => (v === 1 || v === -1 ? v : 0);
 const r1 = (v: number) => Math.round(v * 10) / 10;
@@ -230,6 +186,8 @@ export class Room extends DurableObject<Env> {
   events: GameEvent[] = [];
   timer: ReturnType<typeof setInterval> | null = null;
   settings: RoomSettings = DEFAULT_SETTINGS;
+  world: GameMap = basicMap(); // this room's map (tiles, spawns, capture points)
+  grid = makeGrid(this.world.tiles);
   get mode() { return this.settings.mode; }
   points: CapturePoint[] = [];
   score: Record<Team, number> = { A: 0, B: 0 };
@@ -317,7 +275,7 @@ export class Room extends DurableObject<Env> {
     server.addEventListener("error", leave);
 
     server.send(JSON.stringify({
-      t: "init", id: c.id, name: c.name, tile: TILE, map: MAP, code: this.setup?.code ?? null, ...this.config(),
+      t: "init", id: c.id, name: c.name, tile: TILE, map: this.world.tiles, code: this.setup?.code ?? null, ...this.config(),
     }));
     this.startLoop();
     this.playersChanged();
@@ -328,12 +286,13 @@ export class Room extends DurableObject<Env> {
   config() {
     return {
       settings: this.settings,
-      points: this.mode === "conquest" ? POINTS.map((p) => ({ ...p, r: CONQUEST.radius })) : [],
+      points: this.mode === "conquest" ? this.world.points.map((p) => ({ ...p, r: CONQUEST.radius })) : [],
     };
   }
 
   setupRoom(settings: RoomSettings) {
     this.settings = settings;
+    this.loadMap();
     this.debug = { freezeBots: false, closeWhenEmpty: false };
     this.newMatch(Date.now() / 1000);
     this.bullets = [];
@@ -354,9 +313,9 @@ export class Room extends DurableObject<Env> {
   }
 
   newBot(t: Tank): Bot {
-    const home = spawnPoint(t.team, 1);
-    const enemyHome = spawnPoint(t.team === "A" ? "B" : "A", 1);
-    return new Bot(this.settings.botLevel, GRID, { home, enemyHome, bulletSpeed: BULLET_SPEED });
+    const home = this.world.spawns[t.team][1];
+    const enemyHome = this.world.spawns[t.team === "A" ? "B" : "A"][1];
+    return new Bot(this.settings.botLevel, this.grid, { home, enemyHome, bulletSpeed: BULLET_SPEED });
   }
 
   // 人間の少ないチームへ入れる（同数ならA）。両チームとも人間で埋まっていれば null（満員）
@@ -456,7 +415,7 @@ export class Room extends DurableObject<Env> {
   }
 
   spawn(t: Tank) {
-    const s = spawnPoint(t.team, t.slot);
+    const s = this.world.spawns[t.team][t.slot];
     Object.assign(t, { x: s.x, y: s.y, body: s.body, aim: s.body, hp: tankSpec(t.type).hp, dead: false, cooldown: 0, hit: null });
   }
 
@@ -518,6 +477,12 @@ export class Room extends DurableObject<Env> {
     if (p && (m.own.team === "A" || m.own.team === "B")) { p.owner = m.own.team; p.cap = m.own.team === "A" ? 1 : -1; }
   }
 
+  // The map for the current settings. For now always the basic map; generated maps come next (step 7)
+  loadMap() {
+    this.world = basicMap();
+    this.grid = makeGrid(this.world.tiles);
+  }
+
   applySettings(next: RoomSettings) {
     const modeChanged = next.mode !== this.settings.mode;
     const levelChanged = next.botLevel !== this.settings.botLevel;
@@ -544,7 +509,7 @@ export class Room extends DurableObject<Env> {
   resetPoints() {
     this.score = { A: 0, B: 0 };
     this.points = this.mode === "conquest"
-      ? POINTS.map((p) => ({ ...p, cap: 0, owner: null, contested: false }))
+      ? this.world.points.map((p) => ({ ...p, cap: 0, owner: null, contested: false }))
       : [];
   }
 
@@ -638,7 +603,7 @@ export class Room extends DurableObject<Env> {
     const list = this.pins[t.team].filter((p) => p.by !== t.id);
     list.push({
       id: this.nextPinId++, by: t.id, at: now,
-      x: Math.max(0, Math.min(MAP_W * TILE, x)), y: Math.max(0, Math.min(MAP_H * TILE, y)),
+      x: Math.max(0, Math.min(this.world.w * TILE, x)), y: Math.max(0, Math.min(this.world.h * TILE, y)),
     });
     this.pins[t.team] = list;
   }
@@ -676,7 +641,7 @@ export class Room extends DurableObject<Env> {
     for (const t of this.tanks) {
       if (!t.bot || t.dead) continue;
       if (this.debug.freezeBots) { t.input = { ...IDLE, aim: t.aim }; continue; }
-      const enemies = this.tanks.filter((e) => e.team !== t.team && !e.dead && canSeeTank(GRID, t, e));
+      const enemies = this.tanks.filter((e) => e.team !== t.team && !e.dead && canSeeTank(this.grid, t, e));
       const allies = this.tanks.filter((a) => a.team === t.team && a !== t);
       t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now, objectives, pins: this.pins[t.team], ff: this.settings.ff });
       if (t.input.pin) this.addPin(t, t.input.pin.x, t.input.pin.y, now);
@@ -707,7 +672,7 @@ export class Room extends DurableObject<Env> {
       // Conquest: destroyed tanks come back at their own base after a delay
       if (t.dead && this.mode === "conquest" && this.phase === "play" && now >= t.respawnAt) this.spawn(t);
       if (t.dead || !canMove) continue;
-      stepTank(GRID, t, t.input.mx, t.input.my, dt);
+      stepTank(this.grid, t, t.input.mx, t.input.my, dt);
       // 砲塔は入力の向きへ、車種ごとの旋回速度の上限で回す
       t.aim = turnTurret(t.type, t.aim, t.input.aim, dt);
       t.cooldown = Math.max(0, t.cooldown - dt);
@@ -730,7 +695,7 @@ export class Room extends DurableObject<Env> {
       b.y += b.vy * dt;
       b.life -= dt;
       if (b.life <= 0) return false;
-      if (isWall(b.x, b.y)) {
+      if (isWallAt(this.grid, b.x, b.y)) {
         this.events.push({ e: "wall", x: r1(b.x), y: r1(b.y), team: b.team });
         return false;
       }
@@ -765,7 +730,7 @@ export class Room extends DurableObject<Env> {
   shotHints(v: Tank) {
     const step = (Math.PI * 2) / HINT.sectors;
     return this.events
-      .filter((e) => e.e === "fire" && e.team !== v.team && !canSeePoint(GRID, v, e.x, e.y))
+      .filter((e) => e.e === "fire" && e.team !== v.team && !canSeePoint(this.grid, v, e.x, e.y))
       .flatMap((e) => {
         const d = Math.hypot(e.x - v.x, e.y - v.y);
         if (d > HINT.range) return [];
@@ -784,7 +749,7 @@ export class Room extends DurableObject<Env> {
   // 味方と味方の弾は常に含める
   snapshotFor(c: Client, now: number): string {
     const v = this.viewpoint(c);
-    const seen = (x: number, y: number) => canSeePoint(GRID, v, x, y);
+    const seen = (x: number, y: number) => canSeePoint(this.grid, v, x, y);
     const alive = (team: Team) => this.tanks.filter((t) => t.team === team && !t.dead).length;
     return JSON.stringify({
       t: "s",
@@ -804,7 +769,7 @@ export class Room extends DurableObject<Env> {
         pts: this.points.map((p) => ({ id: p.id, o: p.owner, p: r2(p.cap), c: p.contested })),
       },
       tanks: this.tanks
-        .filter((t) => t.team === v.team || (!t.dead && canSeeTank(GRID, v, t)))
+        .filter((t) => t.team === v.team || (!t.dead && canSeeTank(this.grid, v, t)))
         .map((t) => ({
           id: t.id, team: t.team, k: t.type, n: t.name, x: r1(t.x), y: r1(t.y),
           b: r2(t.body), a: r2(t.aim), hp: t.hp, dead: t.dead, bot: t.bot ? 1 : 0,
