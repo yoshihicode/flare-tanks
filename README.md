@@ -6,6 +6,7 @@
 [![Durable Objects](https://img.shields.io/badge/Durable_Objects-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/durable-objects/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![JavaScript](https://img.shields.io/badge/JavaScript-Canvas_2D-F7DF1E?logo=javascript&logoColor=black)](https://developer.mozilla.org/docs/Web/API/Canvas_API)
+[![License](https://img.shields.io/github/license/yoshihicode/flare-tanks)](./LICENSE)
 
 **A real-time 3 vs 3 tank battle for the browser, running entirely on the Cloudflare free plan.**
 
@@ -148,7 +149,7 @@ flare-tanks/
 ### 1. Clone and install
 
 ```bash
-git clone <this repository URL> flare-tanks
+git clone https://github.com/yoshihicode/flare-tanks.git
 cd flare-tanks
 npm install
 ```
@@ -230,16 +231,37 @@ Without `GUEST_SECRET`, `TURNSTILE_SITEKEY` and `TURNSTILE_SECRET`, the Worker r
 
 ## 🚀 Deployment
 
-1. Create a Turnstile widget in the Cloudflare dashboard and add your deploy hostname (for example `flare-tanks.<your-subdomain>.workers.dev`).
-2. Register the secrets and deploy:
+### 1. Create a Turnstile widget
+
+`TURNSTILE_SITEKEY` and `TURNSTILE_SECRET` are not values you make up: they are issued by Cloudflare when you create a Turnstile widget.
+
+1. In the Cloudflare dashboard, open **Turnstile** and add a widget.
+2. Under **Hostname Management**, add the hostname the game will be served from:
+   - `<your-subdomain>.workers.dev` for the default Workers URL. Adding a hostname also allows all of its subdomains, so this covers `flare-tanks.<your-subdomain>.workers.dev`.
+   - Or your own domain, if you use a custom domain.
+
+   Enter the hostname only (no `https://`, port or path). The game doesn't need to be deployed yet.
+3. Choose **Managed** as the widget mode. The game renders the widget with `appearance: interaction-only`, so it only shows up when Cloudflare wants the player to interact.
+4. Create the widget and copy the two keys it shows:
+
+| Widget key | Set it as | Notes |
+| --- | --- | --- |
+| Site Key | `TURNSTILE_SITEKEY` | Public: it is sent to the browser |
+| Secret Key | `TURNSTILE_SECRET` | Keep it secret: used by the Worker to verify tokens |
+
+If you don't know your `workers.dev` subdomain yet, you can deploy first (step 2 without the Turnstile secrets): the deploy succeeds and prints the URL, and the game answers "Server not configured" until the secrets are set.
+
+### 2. Register the secrets and deploy
 
 ```bash
 npx wrangler login
 npx wrangler secret put GUEST_SECRET        # e.g. output of: openssl rand -hex 32
-npx wrangler secret put TURNSTILE_SITEKEY
-npx wrangler secret put TURNSTILE_SECRET
+npx wrangler secret put TURNSTILE_SITEKEY   # the widget's Site Key
+npx wrangler secret put TURNSTILE_SECRET    # the widget's Secret Key
 npm run deploy
 ```
+
+For local development none of this is needed: `npm run dev` uses Cloudflare's always-pass test keys.
 
 The game will be available at `https://flare-tanks.<your-subdomain>.workers.dev`. The Durable Object classes are created from the `migrations` in `wrangler.jsonc` (`new_sqlite_classes`, required on the free plan).
 
@@ -263,3 +285,7 @@ Free tier limits may change. Check the [Durable Objects pricing](https://develop
 
 - Tanks pass through each other (no tank-to-tank collision).
 - The generated 128×128 map is large for 3 vs 3; crossing it takes a heavy tank about 50 seconds.
+
+## 📄 License
+
+[MIT](./LICENSE)
