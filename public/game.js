@@ -94,17 +94,55 @@ chooseTank(tankType);
 
 // ===== 開始・接続 =====
 overlay.addEventListener("click", start);
+// ===== Guest name and signed token (saved in the browser) =====
+const nameInput = document.getElementById("name");
+const errBox = document.getElementById("err");
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode etc.: keep going without saving */ } },
+};
+let guest = { token: store.get("ft.token"), name: store.get("ft.name") || "" };
+nameInput.value = guest.name;
+nameInput.addEventListener("click", (e) => e.stopPropagation()); // typing must not start the game
+
+// Ask the server to check the name and sign (or renew) our token
+async function signIn() {
+  const res = await fetch("/api/guest", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: nameInput.value, token: guest.token }),
+  });
+  const body = await res.json().catch(() => ({ error: "サーバーに接続できません" }));
+  if (!res.ok) throw new Error(body.error || "サーバーに接続できません");
+  guest = { token: body.token, name: body.name };
+  store.set("ft.token", guest.token);
+  store.set("ft.name", guest.name);
+}
+
 addEventListener("keydown", (e) => {
   if (overlay.style.display === "none") return;
+  if (e.key === "Enter") return start();
+  if (e.target === nameInput) return; // 1/2/3 while typing the name are just characters
   const i = ["Digit1", "Digit2", "Digit3"].indexOf(e.code);
   if (i >= 0) chooseTank(TANK_ORDER[i]);
-  if (e.key === "Enter") start();
 });
 
-function start() {
+let starting = false;
+async function start() {
+  if (starting) return;
   // iOS対策：ユーザー操作の中で音を有効化する
   if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
   audio.resume();
+  starting = true;
+  errBox.textContent = "";
+  try {
+    await signIn();
+  } catch (e) {
+    errBox.textContent = e.message;
+    nameInput.focus();
+    return;
+  } finally {
+    starting = false;
+  }
   overlay.style.display = "none";
   connect();
 }
@@ -119,7 +157,7 @@ function connect() {
   const room = params.get("room") || "default";
   const proto = location.protocol === "https:" ? "wss" : "ws";
   // Room settings (?mode=, ?bot=) are passed through; the server uses them only from the first player
-  const q = new URLSearchParams({ room, tank: tankType });
+  const q = new URLSearchParams({ room, tank: tankType, token: guest.token, name: guest.name });
   for (const key of ["mode", "bot"]) if (params.has(key)) q.set(key, params.get(key));
   ws = new WebSocket(`${proto}://${location.host}/ws?${q}`);
   ws.onmessage = (ev) => {
@@ -149,9 +187,12 @@ function connect() {
       m.ev.forEach(playEvent);
     }
   };
-  ws.onclose = () => {
+  ws.onclose = (e) => {
     ws = null;
-    showOverlay("接続が切れました。部屋が満員の場合もあります。クリックで再接続");
+    // 4000: the same guest connected from another tab; 4003: room full
+    const why = e.code === 4000 ? "別の画面で接続したため、この画面は切断されました。"
+      : e.code === 4003 ? "部屋が満員です。" : "接続が切れました。";
+    showOverlay(`${why}クリックで再接続（30秒以内なら同じ戦車に戻れます）`);
   };
 }
 
@@ -466,6 +507,21 @@ function drawMarks(view) {
 }
 
 // Point letters are text, so they go on the high-resolution HUD layer
+// Names over tanks (HUD layer so kanji stay sharp). Bots are labeled "bot"
+function drawNames(tanks) {
+  hud.font = "7px DotGothic16, monospace";
+  hud.textAlign = "center";
+  hud.textBaseline = "bottom";
+  for (const k of tanks) {
+    if (k.dead) continue;
+    const sp = SPRITE[k.k] || SPRITE.medium;
+    hud.fillStyle = k.id === myId ? PALETTE.flare : k.n ? "#e9e4d4" : "#8a8778";
+    hud.fillText(k.n ?? "bot", k.x - cam.x, k.y - cam.y - sp.l - 5);
+  }
+  hud.textAlign = "left";
+  hud.textBaseline = "top";
+}
+
 function drawPointLabels() {
   hud.font = "8px DotGothic16, monospace";
   hud.textAlign = "center";
@@ -590,6 +646,7 @@ function frame() {
   drawPins();
   drawMarks(view);
   drawPointLabels();
+  drawNames(tanks);
   drawHud(me);
   syncSettingsPanel();
   requestAnimationFrame(frame);

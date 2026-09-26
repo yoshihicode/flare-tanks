@@ -34,6 +34,13 @@
     }
     #msg { font-size: 1.1rem; }
     #help { font-size: 0.85rem; opacity: 0.75; line-height: 1.7; }
+    #who { display: flex; gap: 0.5rem; align-items: center; }
+    #who input {
+      font: inherit; font-size: 1.1rem; color: var(--ash); background: rgba(0, 0, 0, 0.35);
+      border: 2px solid #4a483e; padding: 0.3rem 0.6rem; width: 12em;
+    }
+    #who input:focus-visible { outline: 2px solid var(--flare); outline-offset: 2px; }
+    #err { color: #ff8a7a; min-height: 1.2em; }
     #tanks { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; }
     #tanks button {
       font: inherit; color: var(--ash); background: rgba(0, 0, 0, 0.35);
@@ -65,7 +72,9 @@
   <canvas id="hud" aria-hidden="true"></canvas>
   <div id="overlay" role="button" tabindex="0">
     <h1>FLARE TANKS</h1>
+    <label id="who">名前 <input id="name" maxlength="12" autocomplete="nickname" placeholder="12文字まで"></label>
     <div id="tanks" role="group" aria-label="戦車の選択"></div>
+    <div id="err" role="alert"></div>
     <div id="msg">戦車を選んで出撃（1・2・3キーでも選べます）</div>
     <div id="help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン（敵発見を味方に知らせる）</div>
   </div>

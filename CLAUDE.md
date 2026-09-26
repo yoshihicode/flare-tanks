@@ -5,12 +5,14 @@ Cloudflare Workers 無料プランだけで動く、ブラウザ向けトップ�
 
 ## コマンド
 - `npm run dev`：ローカル起動（http://localhost:8787、`?room=名前` で部屋分け、`?bot=1〜5` で部屋の bot の強さ、`?mode=conquest` で拠点制圧モード。部屋の設定は最初に入った人の指定を使う）
-  - 開発時だけデバッグ用コマンド（`{t:"dbg"}`：bot停止・段階の残り時間変更・全滅・HP設定・自機の瞬間移動・ポイント設定・拠点の持ち主設定）が有効（`--var DEBUG_TOOLS:1`）。デプロイ版では無効
+  - ゲストトークンの署名鍵は dev では `--var GUEST_SECRET:...`（開発用の値）。本番は `wrangler secret put GUEST_SECRET`
+  - 開発時だけデバッグ用コマンド（`{t:"dbg"}`：bot停止・段階の残り時間変更・全滅・HP設定・自機の瞬間移動・ポイント設定・拠点の持ち主設定・再接続の確保期限切れ）が有効（`--var DEBUG_TOOLS:1`）。デプロイ版では無効
 - `npm run test:smoke`：自動テスト（dev起動中に別ターミナルで実行、約25秒）。5部屋を並行で使い、撃ち合い・視界・bot・殲滅モードと拠点制圧モードの流れ・ピン・発砲音ヒントを確認する。残像（`public/ghosts.js`）とbot 単体（`scripts/bot-checks.mjs`）の確認も含む
 - `npm run deploy`：Cloudflareへデプロイ（事前に `npx wrangler login`）
 
 ## 構成
 - `src/index.ts`：Worker（`/ws` を部屋へ振り分け）と `Room`（Durable Object。1部屋＝1インスタンス）。人間の接続（Client）と戦車6枠（Tank）を分けて管理し、空き枠は bot が操作する。試合の進行（殲滅モード・拠点制圧モード）、ピン、発砲音ヒントもここ
+- `src/guest.ts`：ゲスト識別（トークンの署名・検証、名前の確認）。`src/settings.ts`：部屋の設定の検証。どちらも Node から直接テストできる
 - `src/bot.ts`：bot の思考（A*・状態遷移・強さ5段階）。Room に依存せず、Node から直接テストできる
 - `public/`：静的配信。`index.html`（タイトル画面）、`game.js`（描画・入力・通信・効果音）、`ghosts.js`（見えなくなった敵の残像。クライアントのみ）
 - `public/shared.js`：サーバーとクライアントで共有する判定（壁・移動・砲塔旋回・見通し線・視界・可視ポリゴン）と戦車3種の性能（`TANK_TYPES`）。サーバーは `import` してバンドルする

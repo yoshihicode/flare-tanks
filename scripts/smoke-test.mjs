@@ -7,17 +7,28 @@ import {
 } from "../public/shared.js";
 import { botChecks } from "./bot-checks.mjs";
 import { updateGhosts, GHOST } from "../public/ghosts.js";
+import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
 
 const BASE = process.env.WS_URL || "ws://localhost:8787/ws";
+const HTTP = BASE.replace(/^ws/, "http").replace(/\/ws$/, "");
+// Get a signed guest token (spec: guest identity). Returns {status, body}
+async function guest(name, token) {
+  const res = await fetch(`${HTTP}/api/guest`, { method: "POST", body: JSON.stringify({ name, token }) });
+  return { status: res.status, body: await res.json() };
+}
 const room = "smoke-" + Date.now();
 const DURATION = 20000;
 let grid = null;
 
 // 参加して最初のスナップショットを受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
 // c.id は自分が操作している戦車のID（bot の枠を引き継ぐので、スナップショットの me で知る）
-function join(tank, roomName = room, extra = "") {
+// who: {name, token} to join as a given guest (a fresh guest token is fetched otherwise)
+async function join(tank, roomName = room, extra = "", who = {}) {
+  const name = who.name ?? "tester";
+  const token = who.token ?? (await guest(name)).body.token;
   return new Promise((resolve, reject) => {
-    const c = { ws: new WebSocket(`${BASE}?room=${roomName}&tank=${tank}${extra}`), id: null, onSnap: null };
+    const q = new URLSearchParams({ room: roomName, tank, token, name });
+    const c = { ws: new WebSocket(`${BASE}?${q}${extra}`), id: null, onSnap: null, token, name };
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
@@ -283,6 +294,71 @@ const settingsDone = (async () => {
   sstep("フレンドリーファイアなしなら味方に当たらない", off.lost === 0, `ally lost ${off.lost}hp`);
 })();
 
+// ===== Guest identity: offline checks of src/guest.ts, then the API and a room =====
+const guestChecks = [];
+const gstep = (name, ok, detail = "") => guestChecks.push([name, ok, detail]);
+const guestDone = (async () => {
+  const secret = "test-secret";
+  const gid = newGuestId();
+  const tok = await signToken(secret, gid);
+  const tampered = tok.slice(0, -2) + (tok.endsWith("A") ? "BB" : "AA");
+  gstep("トークン：署名を検証でき、改ざん・別の鍵は拒否",
+    (await verifyToken(secret, tok)) === gid && (await verifyToken(secret, tampered)) === null
+      && (await verifyToken("other", tok)) === null && (await verifyToken(secret, "v1.x.1.y")) === null);
+  const names = ["", "   ", "１２３４５６７８９０１２３", "Admin", "  よしお  ", "a\u0007b"].map((n) => checkName(n));
+  gstep("名前：空・13文字・禁止語は拒否、前後の空白と制御文字は除く",
+    names.slice(0, 4).every((r) => "error" in r) && names[4].name === "よしお" && names[5].name === "ab",
+    JSON.stringify(names.map((r) => r.name ?? r.error)));
+  gstep("同名には番号を付ける", uniqueName("Yoshi", new Set(["Yoshi", "Yoshi(2)"])) === "Yoshi(3)" && uniqueName("A", new Set()) === "A");
+
+  const bad = await guest("x".repeat(13));
+  const first = await guest("Yoshi");
+  const again = await guest("Yoshi2", first.body.token);
+  const forged = await guest("Yoshi", tampered);
+  gstep("API：不正な名前は400、正しいトークンは同じゲストIDのまま名前だけ変わる",
+    bad.status === 400 && first.status === 200 && again.body.gid === first.body.gid && again.body.name === "Yoshi2"
+      && forged.body.gid !== first.body.gid, `bad=${bad.status} gid kept=${again.body.gid === first.body.gid}`);
+
+  const noToken = await new Promise((resolve) => {
+    const ws = new WebSocket(`${BASE}?room=${room}-guest&tank=medium&name=x`);
+    ws.onmessage = () => resolve(false);
+    ws.onerror = ws.onclose = () => resolve(true);
+    setTimeout(() => resolve(false), 3000);
+  });
+  gstep("トークンなしでは部屋に入れない", noToken);
+
+  const room7 = room + "-guest";
+  const p = await join("medium", room7, "", { name: "Yoshi" }); // A, owner
+  debug(p, { freezeBots: true });
+  const q = await join("heavy", room7, "", { name: "Yoshi" }); // B, same display name
+  gstep("同じ部屋の同名は「Yoshi(2)」になる", p.init.name === "Yoshi" && q.init.name === "Yoshi(2)",
+    `${p.init.name} / ${q.init.name}`);
+  const myName = p.last.tanks.find((k) => k.id === p.id)?.n;
+  const botName = p.last.tanks.find((k) => k.team === "A" && k.id !== p.id)?.n;
+  gstep("スナップショットに名前が入る（bot は null）", myName === "Yoshi" && botName === null, `me=${myName} bot=${botName}`);
+
+  await startNow(p);
+  const tankId = q.id;
+  q.ws.close();
+  await until(() => q.last && false, 300);
+  const q2 = await join("medium", room7, "", { name: "Yoshi", token: q.token });
+  await until(() => q2.last?.me === tankId);
+  gstep("切断から30秒以内なら、対戦中でも自分の戦車に戻れる（車種もそのまま）",
+    q2.id === tankId && q2.last.tanks.find((k) => k.id === tankId)?.k === "heavy" && p.last.g.ph === "play",
+    `before=${tankId} after=${q2.id}`);
+
+  const closedWith = new Promise((resolve) => { q2.ws.onclose = (e) => resolve(e.code); });
+  const q3 = await join("medium", room7, "", { name: "Yoshi", token: q.token });
+  const code = await Promise.race([closedWith, sleep(2000).then(() => null)]);
+  gstep("同じゲストが別の画面で入ると、古い接続を切って引き継ぐ", code === 4000 && q3.id === tankId, `close=${code} me=${q3.id}`);
+
+  q3.ws.close();
+  await sleep(300);
+  debug(p, { expireReserve: true });
+  const q4 = await join("medium", room7, "", { name: "Yoshi", token: q.token });
+  gstep("30秒を過ぎたら戻れない（殲滅の対戦中なので観戦）", q4.id === null, `me=${q4.id}`);
+})();
+
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
 function inPolygon(pts, x, y) {
   let inside = false;
@@ -430,6 +506,7 @@ setTimeout(async () => {
   await conquestDone;
   await botCaptureDone;
   await settingsDone;
+  await guestDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
@@ -440,6 +517,7 @@ setTimeout(async () => {
     ...flow,
     ...conquest,
     ...setting,
+    ...guestChecks,
     ["拠点制圧：bot が自分で拠点を取る", botCapture.owned !== null, `owned=${botCapture.owned}`],
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],

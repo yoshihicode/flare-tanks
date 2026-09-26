@@ -6,6 +6,7 @@ import {
 } from "../public/shared.js";
 import { Bot, type Pin } from "./bot.ts";
 import { DEFAULT_SETTINGS, parseSettings, settingsFromQuery, type RoomSettings } from "./settings.ts";
+import { GUEST, checkName, newGuestId, signToken, uniqueName, verifyToken } from "./guest.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
 const TEAM_SIZE = 3; // 1チームの台数（3vs3）。空いた枠は bot が埋める
@@ -63,12 +64,15 @@ interface Tank {
   hurt: number[]; // directions (toward the shooter) of hits taken this tick, sent to the tank's own player
   input: Input;
   human: string | null; // 操作している接続のID
+  name: string | null; // display name of the human driving it (null for bots)
   bot: Bot | null;
   hit: { dir: number; at: number } | null; // 最後に撃たれた方向（bot が振り向くのに使う）
 }
 // 人間の接続
 interface Client {
   id: string; ws: WebSocket; team: Team; type: TankType;
+  gid: string; // guest ID from the signed token
+  name: string; // display name, made unique within the room ("Yoshi(2)")
   tank: Tank | null; // null の間は観戦（対戦中に入った人は次のラウンドから参加）
   seq: number; // 最後に受け取った入力の確認番号（クライアントの予測補正用に返す）
 }
@@ -81,6 +85,7 @@ interface CapturePoint { id: string; x: number; y: number; cap: number; owner: T
 
 interface Env {
   ROOM: DurableObjectNamespace;
+  GUEST_SECRET?: string; // signs guest tokens. Dev: set by npm run dev. Production: wrangler secret put GUEST_SECRET
   DEBUG_TOOLS?: string; // "1" のときだけデバッグ用コマンドを受け付ける（npm run dev で有効）
 }
 
@@ -135,16 +140,44 @@ const r2 = (v: number) => Math.round(v * 100) / 100;
 const IDLE: Input = { mx: 0, my: 0, aim: 0, fire: false };
 
 // ===== Worker：/ws を部屋のDurable Objectへ振り分ける =====
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json; charset=utf-8" } });
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    // Refuse to run without a signing secret rather than fall back to a guessable default
+    if ((url.pathname === "/ws" || url.pathname.startsWith("/api/")) && !env.GUEST_SECRET) {
+      return new Response("サーバーの設定が未完了です（GUEST_SECRET）", { status: 500 });
+    }
+    const secret = env.GUEST_SECRET!;
+
+    // Issue (or renew) a guest token: {name, token?} -> {token, gid, name}. A valid token keeps its guest ID
+    if (url.pathname === "/api/guest" && req.method === "POST") {
+      const body = await req.text();
+      if (body.length > 1000) return json({ error: "リクエストが大きすぎます" }, 413);
+      let m: any;
+      try { m = JSON.parse(body); } catch { return json({ error: "不正なリクエストです" }, 400); }
+      const checked = checkName(m?.name);
+      if ("error" in checked) return json({ error: checked.error }, 400);
+      const gid = (await verifyToken(secret, m?.token)) ?? newGuestId();
+      return json({ token: await signToken(secret, gid), gid, name: checked.name });
+    }
+
     if (url.pathname === "/ws") {
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("WebSocket接続が必要です", { status: 426 });
       }
+      const gid = await verifyToken(secret, url.searchParams.get("token"));
+      const checked = checkName(url.searchParams.get("name"));
+      if (!gid || "error" in checked) return new Response("ゲストの確認に失敗しました", { status: 401 });
       const room = (url.searchParams.get("room") || "default").slice(0, 32);
       const stub = env.ROOM.get(env.ROOM.idFromName(room));
-      return stub.fetch(req);
+      // The room trusts these headers: rooms are reachable only through this Worker
+      const fwd = new Request(req);
+      fwd.headers.set("X-Guest-Id", gid);
+      fwd.headers.set("X-Guest-Name", encodeURIComponent(checked.name));
+      return stub.fetch(fwd);
     }
     return new Response("Not found", { status: 404 });
   },
@@ -162,6 +195,8 @@ export class Room extends DurableObject<Env> {
   points: CapturePoint[] = [];
   score: Record<Team, number> = { A: 0, B: 0 };
   lastTickAt = 0; // wall-clock time of the previous tick (s)
+  reserved = new Map<string, { tankId: string; until: number }>(); // guest ID -> tank held after a disconnect
+  emptySince = 0; // when the last human left
   pins: Record<Team, Pin[]> = { A: [], B: [] };
   nextPinId = 1;
   debug = { freezeBots: false };
@@ -175,28 +210,49 @@ export class Room extends DurableObject<Env> {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    const gid = req.headers.get("X-Guest-Id");
+    const baseName = decodeURIComponent(req.headers.get("X-Guest-Name") || "");
+    if (!gid || !baseName) return new Response("ゲストの確認に失敗しました", { status: 401 });
     // 最初の1人が来たときに6枠を bot で用意する（部屋の設定は最初の人の指定を使う）
-    if (this.clients.size === 0) this.setupRoom(settingsFromQuery(url.searchParams));
+    if (!this.tanks.length) this.setupRoom(settingsFromQuery(url.searchParams));
+    const now = Date.now() / 1000;
     const type = toTankType(url.searchParams.get("tank"));
-    const team = this.pickTeam();
-    if (!team) return new Response("満員です", { status: 503 });
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
 
-    const c: Client = { id: crypto.randomUUID().slice(0, 8), ws: server, team, type, tank: null, seq: 0 };
-    this.clients.set(c.id, c);
-    // 対戦が始まる前なら bot の枠をすぐ引き継ぐ。対戦中は観戦して次のラウンドから参加する
-    // Conquest mode has no spectating: late joiners replace a bot immediately
-    if (this.phase === "wait" || this.phase === "countdown" || this.mode === "conquest") this.seat(c);
+    // Same guest connecting again (another tab, or a reconnect before the old socket noticed):
+    // move the existing player over to the new socket and close the old one
+    let c = [...this.clients.values()].find((x) => x.gid === gid);
+    if (c) {
+      const old = c.ws;
+      c.ws = server;
+      try { old.close(4000, "別の画面で接続しました"); } catch { /* already closed */ }
+    } else {
+      // A tank held for this guest after a recent disconnect is given back, even mid-round
+      const held = this.reserved.get(gid);
+      const tank = held && held.until > now ? this.tanks.find((t) => t.id === held.tankId && !t.human) : undefined;
+      const team = tank ? tank.team : this.pickTeam();
+      if (!team) { server.close(4003, "満員です"); return new Response(null, { status: 101, webSocket: client }); }
+      const taken = new Set([...this.clients.values()].map((x) => x.name));
+      c = { id: crypto.randomUUID().slice(0, 8), ws: server, team, type, gid, name: uniqueName(baseName, taken), tank: null, seq: 0 };
+      this.clients.set(c.id, c);
+      this.reserved.delete(gid);
+      if (tank) this.takeOver(c, tank, true);
+      // 対戦が始まる前なら bot の枠をすぐ引き継ぐ。対戦中は観戦して次のラウンドから参加する
+      // Conquest mode has no spectating: late joiners replace a bot immediately
+      else if (this.phase === "wait" || this.phase === "countdown" || this.mode === "conquest") this.seat(c);
+    }
 
-    server.addEventListener("message", (ev) => this.onMessage(c, ev.data));
-    const leave = () => this.leave(c);
+    const me = c;
+    server.addEventListener("message", (ev) => { if (me.ws === server) this.onMessage(me, ev.data); });
+    // Only the socket currently attached to the player counts as leaving
+    const leave = () => { if (me.ws === server) this.leave(me); };
     server.addEventListener("close", leave);
     server.addEventListener("error", leave);
 
-    server.send(JSON.stringify({ t: "init", id: c.id, tile: TILE, map: MAP, ...this.config() }));
+    server.send(JSON.stringify({ t: "init", id: c.id, name: c.name, tile: TILE, map: MAP, ...this.config() }));
     this.startLoop();
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -221,7 +277,7 @@ export class Room extends DurableObject<Env> {
         const t: Tank = {
           id: `${team}${slot}`, team, slot, type: BOT_TYPES[slot],
           x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0, respawnAt: 0, pinAt: -Infinity, hurt: [],
-          input: { ...IDLE }, human: null, bot: null, hit: null,
+          input: { ...IDLE }, human: null, name: null, bot: null, hit: null,
         };
         t.bot = this.newBot(t);
         this.spawn(t);
@@ -258,26 +314,33 @@ export class Room extends DurableObject<Env> {
   }
 
   // 人間が bot の枠を引き継ぐ。車種が違えば選んだ車種に乗り換えて出撃し直す
-  takeOver(c: Client, t: Tank) {
+  // keepType: reclaiming one's own tank after a reconnect keeps it exactly as it is
+  takeOver(c: Client, t: Tank, keepType = false) {
     t.human = c.id;
+    t.name = c.name;
     t.bot = null;
     t.input = { ...IDLE, aim: t.aim };
     c.tank = t;
-    if (t.type !== c.type) {
+    if (!keepType && t.type !== c.type) {
       t.type = c.type;
       this.spawn(t);
     }
   }
 
   // 切断：操作していた戦車はその場で bot が引き継ぐ。人間が0人になったら部屋を止める
+  // The tank is also held for this guest for a while so they can reclaim it by reconnecting.
+  // With no humans left the room keeps running until that window passes, then stops (see tick)
   leave(c: Client) {
     if (!this.clients.delete(c.id)) return;
+    const now = Date.now() / 1000;
     if (c.tank) {
       c.tank.human = null;
+      c.tank.name = null;
       c.tank.bot = this.newBot(c.tank);
       c.tank.input = { ...IDLE, aim: c.tank.aim };
+      this.reserved.set(c.gid, { tankId: c.tank.id, until: now + GUEST.reserveSec });
     }
-    if (this.clients.size === 0) this.stopLoop();
+    if (this.clients.size === 0) this.emptySince = now;
   }
 
   spawn(t: Tank) {
@@ -318,6 +381,7 @@ export class Room extends DurableObject<Env> {
     if (this.env.DEBUG_TOOLS !== "1") return;
     const now = Date.now() / 1000;
     if (typeof m.freezeBots === "boolean") this.debug.freezeBots = m.freezeBots;
+    if (m.expireReserve === true) this.reserved.clear(); // pretend the reconnect window has passed
     if (Number.isFinite(m.phaseSec)) this.phaseEndsAt = now + m.phaseSec; // いまの段階の残り時間を変える
     if (m.killTeam === "A" || m.killTeam === "B") {
       for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; t.respawnAt = now + CONQUEST.respawnSec; }
@@ -474,6 +538,7 @@ export class Room extends DurableObject<Env> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.lastTickAt = 0;
+    this.reserved.clear();
     this.tanks = [];
     this.bullets = [];
   }
@@ -499,6 +564,8 @@ export class Room extends DurableObject<Env> {
     // real elapsed time: timers can fire a bit slower than 20Hz, and the time limit is wall-clock
     const realDt = this.lastTickAt ? Math.min(0.25, Math.max(0, now - this.lastTickAt)) : dt;
     this.lastTickAt = now;
+    // Nobody came back within the reconnect window: close the room (spec: stop the DO with 0 humans)
+    if (this.clients.size === 0 && now - this.emptySince > GUEST.reserveSec) return this.stopLoop();
     this.updatePhase(now);
     for (const team of TEAMS) this.pins[team] = this.pins[team].filter((p) => now - p.at < PIN.lifeSec);
     this.thinkBots(now);
@@ -611,7 +678,7 @@ export class Room extends DurableObject<Env> {
       tanks: this.tanks
         .filter((t) => t.team === v.team || (!t.dead && canSeeTank(GRID, v, t)))
         .map((t) => ({
-          id: t.id, team: t.team, k: t.type, x: r1(t.x), y: r1(t.y),
+          id: t.id, team: t.team, k: t.type, n: t.name, x: r1(t.x), y: r1(t.y),
           b: r2(t.body), a: r2(t.aim), hp: t.hp, dead: t.dead, bot: t.bot ? 1 : 0,
         })),
       // Own team's pins only (placed by allies, so no hidden information)
