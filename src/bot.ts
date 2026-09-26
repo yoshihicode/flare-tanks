@@ -35,11 +35,11 @@ type Tile = [number, number];
 // reaction：敵を見つけてから撃ち始めるまで（秒）。aimError：狙いのぶれの最大（ラジアン）
 // retreatHp：この割合までHPが減ったら退避する（0なら退避しない）
 export const BOT_LEVELS = {
-  1: { name: "入門", reaction: 0.9, aimError: 0.3, retreatHp: 0, keepDistance: false, ambush: false, flank: false, lead: false, share: false },
-  2: { name: "初級", reaction: 0.6, aimError: 0.2, retreatHp: 0.3, keepDistance: true, ambush: false, flank: false, lead: false, share: false },
-  3: { name: "標準", reaction: 0.4, aimError: 0.12, retreatHp: 0.3, keepDistance: true, ambush: true, flank: false, lead: false, share: false },
-  4: { name: "上級", reaction: 0.25, aimError: 0.06, retreatHp: 0.35, keepDistance: true, ambush: true, flank: true, lead: true, share: false },
-  5: { name: "達人", reaction: 0.15, aimError: 0.03, retreatHp: 0.35, keepDistance: true, ambush: true, flank: true, lead: true, share: true },
+  1: { reaction: 0.9, aimError: 0.3, retreatHp: 0, keepDistance: false, ambush: false, flank: false, lead: false, share: false },
+  2: { reaction: 0.6, aimError: 0.2, retreatHp: 0.3, keepDistance: true, ambush: false, flank: false, lead: false, share: false },
+  3: { reaction: 0.4, aimError: 0.12, retreatHp: 0.3, keepDistance: true, ambush: true, flank: false, lead: false, share: false },
+  4: { reaction: 0.25, aimError: 0.06, retreatHp: 0.35, keepDistance: true, ambush: true, flank: true, lead: true, share: false },
+  5: { reaction: 0.15, aimError: 0.03, retreatHp: 0.35, keepDistance: true, ambush: true, flank: true, lead: true, share: true },
 } as const;
 export type BotLevel = keyof typeof BOT_LEVELS;
 

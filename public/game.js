@@ -3,6 +3,15 @@ import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "./to
 import { INTERP, sample, pushSnapshot } from "./interp.js";
 import { MINIMAP, minimapLayout, minimapDots, minimapWalls } from "./minimap.js";
 import { SFX, FIRE_SFX, synth } from "./sfx.js";
+import { t, setLang, getLang, detectLang, applyI18n } from "./i18n.js";
+
+// ===== Language (English / Japanese): saved choice, else the browser's preference =====
+{
+  let saved = null;
+  try { saved = localStorage.getItem("ft.lang"); } catch { /* storage may be unavailable */ }
+  setLang(saved ?? detectLang(navigator.languages ?? [navigator.language]));
+  applyI18n(document);
+}
 import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
@@ -80,12 +89,21 @@ const TANK_ORDER = ["light", "medium", "heavy"];
 let tankType = DEFAULT_TANK;
 try { const saved = localStorage.getItem("ft.tank"); if (saved in TANK_TYPES) tankType = saved; } catch { /* 保存できない環境では既定値 */ }
 const tankButtons = document.getElementById("tanks");
-for (const type of TANK_ORDER) {
+// Card text: name, role, HP / damage, view angle (rebuilt when the language changes)
+function tankCard(btn, type) {
   const s = TANK_TYPES[type];
+  const name = document.createElement("b");
+  name.textContent = t(`tank.${type}.name`);
+  const small = document.createElement("small");
+  const lines = [t(`tank.${type}.role`), t("tank.hpDamage", { hp: s.hp, damage: s.damage }), t("tank.fov", { fov: Math.round((s.fov * 180) / Math.PI) })];
+  lines.forEach((line, i) => { if (i) small.append(document.createElement("br")); small.append(line); });
+  btn.replaceChildren(name, small);
+}
+for (const type of TANK_ORDER) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.dataset.type = type;
-  btn.innerHTML = `<b>${s.name}</b><small>${s.role}<br>HP ${s.hp}・ダメージ ${s.damage}<br>視野角 ${Math.round((s.fov * 180) / Math.PI)}°</small>`;
+  tankCard(btn, type);
   btn.addEventListener("click", async () => {
     chooseTank(type);
     btn.setAttribute("aria-busy", "true"); // show the click registered while we sign in
@@ -117,8 +135,8 @@ async function signIn() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: nameInput.value, token: guest.token }),
   });
-  const body = await res.json().catch(() => ({ error: "サーバーに接続できません" }));
-  if (!res.ok) throw new Error(body.error || "サーバーに接続できません");
+  const body = await res.json().catch(() => ({ code: "network" }));
+  if (!res.ok) throw new Error(errorText(body));
   guest = { token: body.token, name: body.name };
   store.set("ft.token", guest.token);
   store.set("ft.name", guest.name);
@@ -133,7 +151,7 @@ function loadTurnstile() {
     const s = document.createElement("script");
     s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
     s.onload = resolve;
-    s.onerror = () => reject(new Error("自動プログラム対策を読み込めませんでした。通信環境を確認してください"));
+    s.onerror = () => reject(new Error(t("err.turnstileLoad")));
     document.head.append(s);
   });
 }
@@ -146,10 +164,13 @@ async function humanToken() {
     // The container must not have id="turnstile": that id would shadow window.turnstile
     turnstileWidget = window.turnstile.render("#humanCheck", {
       sitekey: turnstileKey, appearance: "interaction-only", callback: resolve,
-      "error-callback": () => reject(new Error("自動プログラム対策の確認に失敗しました。もう一度お試しください")),
+      "error-callback": () => reject(new Error(t("err.turnstileFail"))),
     });
   });
 }
+
+// Server errors carry a code (see src/index.ts); the words come from i18n.js
+const errorText = (body) => (body?.code ? t(`err.${body.code}`, body) : body?.error || t("err.network"));
 
 // Room actions go through the Worker with our token. Returns the JSON body or throws with its error text
 async function api(path, body = {}) {
@@ -157,8 +178,8 @@ async function api(path, body = {}) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token: guest.token, ...body }),
   });
-  const data = await res.json().catch(() => ({ error: "サーバーに接続できません" }));
-  if (!res.ok) throw new Error(data.error || "サーバーに接続できません");
+  const data = await res.json().catch(() => ({ code: "network" }));
+  if (!res.ok) throw new Error(errorText(data));
   return data;
 }
 
@@ -236,7 +257,9 @@ function closeLobby() {
 }
 
 let pendingRooms = null; // a list update that arrived while a lobby action was in progress
+let shownRooms = []; // the last list, redrawn when the language changes
 function renderRooms(rooms) {
+  shownRooms = rooms;
   // Don't swap out the buttons under the player's click while they're joining
   if (lobbyBusy) { pendingRooms = rooms; return; }
   pendingRooms = null;
@@ -244,21 +267,27 @@ function renderRooms(rooms) {
   if (!rooms.length) {
     const li = document.createElement("li");
     li.className = "empty";
-    li.textContent = "公開部屋はまだありません。クイック参加か「部屋を作る」で始めましょう";
+    li.textContent = t("lobby.empty");
     roomList.append(li);
     return;
   }
   for (const r of rooms) {
     const li = document.createElement("li");
     const info = document.createElement("div");
-    const rule = r.mode === "elim" ? `殲滅・${r.winRounds}ラウンド先取` : "拠点制圧";
-    info.innerHTML = `<div>${rule}・${mapText(r)}</div><div class="meta">${r.humans}/${r.capacity}人・${r.playing ? "対戦中" : "待機中"}・bot Lv${r.botLevel}・FF${r.ff ? "あり" : "なし"}</div>`;
+    const rule = r.mode === "elim" ? `${t("set.mode.elim")} · ${t("rule.elim", { n: r.winRounds })}` : t("set.mode.conquest");
+    const head = document.createElement("div");
+    head.textContent = `${rule} · ${mapText(r)}`;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = [t("lobby.players", { n: r.humans, cap: r.capacity }), t(r.playing ? "lobby.playing" : "lobby.waiting"),
+      t("rule.bot", { n: r.botLevel }), t(r.ff ? "rule.ffOn" : "rule.ffOff")].join(" · ");
+    info.append(head, meta);
     const btn = document.createElement("button");
     btn.className = "btn";
     btn.type = "button";
-    btn.textContent = r.humans >= r.capacity ? "満員" : "参加";
+    btn.textContent = t(r.humans >= r.capacity ? "lobby.full" : "lobby.join");
     btn.disabled = r.humans >= r.capacity;
-    btn.addEventListener("click", busyButton(btn, "接続中…", () => enterRoom(r.id)));
+    btn.addEventListener("click", busyButton(btn, "lobby.joining", () => enterRoom(r.id)));
     li.append(info, btn);
     roomList.append(li);
   }
@@ -267,14 +296,14 @@ function renderRooms(rooms) {
 // Joining takes a few seconds (Turnstile + connecting), so show that the click registered:
 // the button changes its text and color, and other lobby actions wait until this one finishes
 let lobbyBusy = false;
-function busyButton(btn, text, fn) {
+function busyButton(btn, textKey, fn) {
   return async (...args) => {
     if (lobbyBusy) return;
     lobbyBusy = true;
     const label = btn.textContent;
     btn.setAttribute("aria-busy", "true");
     btn.disabled = true;
-    btn.textContent = text;
+    btn.textContent = t(textKey);
     lobbyMsg.textContent = "";
     try {
       await fn(...args);
@@ -291,21 +320,21 @@ function busyButton(btn, text, fn) {
 }
 
 const joinByCode = async (code) => {
-  if (!/^\d{6}$/.test(code)) throw new Error("招待コードは6桁の数字です");
+  if (!/^\d{6}$/.test(code)) throw new Error(t("err.code_format"));
   const { id } = await api("/api/code", { code });
   await enterRoom(id);
 };
 const quickBtn = document.getElementById("quick");
-quickBtn.addEventListener("click", busyButton(quickBtn, "部屋を探しています…", async () => {
+quickBtn.addEventListener("click", busyButton(quickBtn, "lobby.searching", async () => {
   await enterRoom((await api("/api/quick", { ts: await humanToken() })).id);
 }));
 document.getElementById("create").addEventListener("click", () => { createForm.hidden = false; });
 document.getElementById("cancelCreate").addEventListener("click", () => { createForm.hidden = true; });
 document.getElementById("back").addEventListener("click", () => showScreen("title"));
 const codeForm = document.getElementById("codeForm");
-const joinCode = busyButton(codeForm.querySelector("button"), "接続中…", () => joinByCode(document.getElementById("code").value.trim()));
+const joinCode = busyButton(codeForm.querySelector("button"), "lobby.joining", () => joinByCode(document.getElementById("code").value.trim()));
 codeForm.addEventListener("submit", (e) => { e.preventDefault(); joinCode(); });
-const createRoom = busyButton(createForm.querySelector("button[type=submit]"), "作成中…", async () => {
+const createRoom = busyButton(createForm.querySelector("button[type=submit]"), "lobby.creating", async () => {
   const f = createForm.elements;
   const settings = {
     mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value),
@@ -317,7 +346,18 @@ const createRoom = busyButton(createForm.querySelector("button[type=submit]"), "
   await enterRoom(id);
 });
 createForm.addEventListener("submit", (e) => { e.preventDefault(); createRoom(); });
-rejoinBtn.addEventListener("click", busyButton(rejoinBtn, "接続中…", async () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc)));
+rejoinBtn.addEventListener("click", busyButton(rejoinBtn, "lobby.joining", async () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc)));
+
+// Language switch on the title screen: redraw everything that has text
+document.getElementById("langBtn").addEventListener("click", () => {
+  setLang(getLang() === "ja" ? "en" : "ja");
+  store.set("ft.lang", getLang());
+  applyI18n(document);
+  for (const b of tankButtons.children) tankCard(b, b.dataset.type);
+  setMuted(muted); // the sound button's text
+  renderRooms(shownRooms);
+  renderPlayers();
+});
 
 // Joining needs its own Turnstile token too (spec: check on create and join)
 async function enterRoom(id, adhoc = false) {
@@ -338,7 +378,7 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
     if (!ws || !inGame()) return;
     hiddenAt = performance.now();
-    leaveRoom("画面を離れたため切断しました。");
+    leaveRoom(t("close.hidden"));
   } else if (hiddenAt && lastRoom && performance.now() - hiddenAt < REJOIN_WITHIN_MS) {
     hiddenAt = 0;
     rejoinBtn.click();
@@ -422,13 +462,8 @@ function roomClosed(code, leftOnPurpose, message) {
   ws = null;
   curr = prev = null;
   playersPanel.style.display = "none";
-  const why = {
-    1000: leftOnPurpose ? "部屋から出ました。" : "部屋が閉じられました。",
-    4000: "別の画面で接続したため、この画面は切断されました。",
-    4003: "部屋が満員です。",
-    4404: "部屋が見つかりません（閉じられた可能性があります）。",
-    4005: "この部屋からは追放されました。",
-  }[code] ?? "接続が切れました。30秒以内なら「さっきの部屋に戻る」で同じ戦車に戻れます。";
+  const why = code === 1000 ? t(leftOnPurpose ? "close.left" : "close.closed")
+    : [4000, 4003, 4404, 4005].includes(code) ? t(`close.${code}`) : t("close.lost");
   if ([4003, 4404, 4005].includes(code)) lastRoom = null;
   showScreen("lobby", message ?? why);
 }
@@ -442,13 +477,13 @@ function renderPlayers() {
   invite.replaceChildren();
   if (inviteCode) {
     const url = `${location.origin}${location.pathname}?code=${inviteCode}`;
-    invite.textContent = `招待コード ${inviteCode} `;
+    invite.textContent = t("players.invite", { code: inviteCode });
     const copy = document.createElement("button");
     copy.className = "btn";
     copy.type = "button";
-    copy.textContent = "招待URLをコピー";
+    copy.textContent = t("players.copy");
     copy.addEventListener("click", async () => {
-      try { await navigator.clipboard.writeText(url); copy.textContent = "コピーしました"; } catch { copy.textContent = url; }
+      try { await navigator.clipboard.writeText(url); copy.textContent = t("players.copied"); } catch { copy.textContent = url; }
     });
     invite.append(copy);
   }
@@ -459,15 +494,15 @@ function renderPlayers() {
     const li = document.createElement("li");
     const name = document.createElement("span");
     name.className = p.team;
-    name.textContent = `${p.name}${p.owner ? "（部屋主）" : ""}`;
+    name.textContent = `${p.name}${p.owner ? t("players.owner") : ""}`;
     li.append(name);
     if (iAmOwner && !p.owner) {
       const kick = document.createElement("button");
       kick.className = "btn";
       kick.type = "button";
-      kick.textContent = "追放";
+      kick.textContent = t("players.kick");
       kick.addEventListener("click", () => {
-        if (confirm(`${p.name} をこの部屋から追放しますか？`)) ws?.send(JSON.stringify({ t: "kick", cid: p.cid }));
+        if (confirm(t("players.kickConfirm", { name: p.name }))) ws?.send(JSON.stringify({ t: "kick", cid: p.cid }));
       });
       li.append(kick);
     }
@@ -525,7 +560,7 @@ const inGame = () => overlay.style.display === "none";
 function setTouchMode() {
   if (!touchMode) return;
   document.body.classList.add("touch");
-  if (titleView && !titleView.hidden) msg.textContent = "戦車をタップしてロビーへ";
+  if (titleView && !titleView.hidden) { msg.dataset.i18n = "title.msgTouch"; msg.textContent = t("title.msgTouch"); }
 }
 setTouchMode();
 addEventListener("touchstart", (e) => {
@@ -825,12 +860,10 @@ function drawFog(me, aim) {
   ctx.drawImage(fogCv, 0, 0);
 }
 
-const TEAM_NAME = { A: "Aチーム", B: "Bチーム" };
 const fmtTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
 // 自分のチームから見た結果
-const resultText = (r) => (r === "draw" ? "引き分け" : r === curr.team ? "勝利" : "敗北");
+const resultText = (r) => t(r === "draw" ? "result.draw" : r === curr.team ? "result.win" : "result.lose");
 
-const MODE_NAME = { elim: "殲滅モード", conquest: "拠点制圧モード" };
 
 // ===== Room settings panel (owner, waiting phase only) =====
 const settingsForm = document.getElementById("settings");
@@ -856,9 +889,9 @@ function syncSettingsPanel() {
     if (el.type === "checkbox") el.checked = value; else el.value = value === null ? "" : String(value);
   }
 }
-const mapText = (s) => (s.map === "random" ? `自動生成マップ（シード ${s.mapSeed ?? "おまかせ"}）` : "標準マップ");
-const settingsText = (s) =>
-  `${mapText(s)}・${s.mode === "elim" ? `${s.winRounds}ラウンド先取` : `${curr.g.tg}pt先取`}・bot Lv${s.botLevel}・FF${s.ff ? "あり" : "なし"}`;
+const mapText = (s) => (s.map === "random" ? t("map.random", { seed: s.mapSeed ?? t("map.seedAuto") }) : t("map.basic"));
+const settingsText = (s) => [mapText(s), s.mode === "elim" ? t("rule.elim", { n: s.winRounds }) : t("rule.conquest", { n: curr.g.tg }),
+  t("rule.bot", { n: s.botLevel }), t(s.ff ? "rule.ffOn" : "rule.ffOff")].join(" · ");
 const ownerColor = (o) => (o ? PALETTE[o] : "#8a8778");
 
 // Capture zones: ring in the owner's color, arc = capture progress of the leading team.
@@ -981,7 +1014,14 @@ function banner(lines, big = false, cy = H / 2) {
     hud.fillText(lines[0], W / 2, cy - 8);
     hud.font = "8px DotGothic16, monospace";
   } else {
-    lines.forEach((t, i) => hud.fillText(t, W / 2, cy - h / 2 + 5 + i * 12));
+    // Lines too wide for the screen (English runs longer than Japanese) are drawn smaller to fit
+    lines.forEach((line, i) => {
+      const width = hud.measureText(line).width;
+      const size = width > W - 8 ? Math.max(5, (8 * (W - 8)) / width) : 8;
+      hud.font = `${size}px DotGothic16, monospace`;
+      hud.fillText(line, W / 2, cy - h / 2 + 5 + i * 12 + (8 - size) / 2);
+    });
+    hud.font = "8px DotGothic16, monospace";
   }
   hud.textAlign = "left";
 }
@@ -1001,8 +1041,8 @@ function drawHud(me) {
     // 左：ラウンド、各チームの勝ち数（●）と生存数
     const marks = (n) => "●".repeat(n) + "○".repeat(Math.max(0, g.wr - n));
     hud.fillStyle = "#c9c4b3"; hud.fillText(`R${g.r}`, 4, 2);
-    hud.fillStyle = PALETTE.A; hud.fillText(`A ${marks(g.w[0])} ${g.al[0]}機`, 22, 2);
-    hud.fillStyle = PALETTE.B; hud.fillText(`B ${marks(g.w[1])} ${g.al[1]}機`, 82, 2);
+    hud.fillStyle = PALETTE.A; hud.fillText(`A ${marks(g.w[0])} ${t("hud.alive", { n: g.al[0] })}`, 22, 2);
+    hud.fillStyle = PALETTE.B; hud.fillText(`B ${marks(g.w[1])} ${t("hud.alive", { n: g.al[1] })}`, 82, 2);
   }
   // 中央：残り時間
   hud.textAlign = "center";
@@ -1010,32 +1050,32 @@ function drawHud(me) {
   if (g.ph === "play") hud.fillText(fmtTime(g.t), W / 2 + 20, 2);
   // 右：自分の車種とHP
   hud.textAlign = "right";
-  if (muted) { hud.fillStyle = "#8a8778"; hud.fillText(touchMode ? "消音" : "消音（M）", W - 4, 14); } // just under the bar
+  if (muted) { hud.fillStyle = "#8a8778"; hud.fillText(t(touchMode ? "hud.mutedTouch" : "hud.muted"), W - 4, 14); } // just under the bar
   if (me) {
     hud.fillStyle = PALETTE.flare;
-    hud.fillText(`${tankSpec(me.k).name}  HP ${me.hp}`, W - 4, 2);
+    hud.fillText(`${t(`tank.${me.k}.name`)}  HP ${me.hp}`, W - 4, 2);
   }
   hud.textAlign = "left";
 
   if (g.ph === "wait") {
     banner([
-      `${MODE_NAME[g.mode]}　待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
-      (g.owner ? (touchMode ? "「今すぐ開始」ボタンで開始" : "Enter キーで今すぐ開始") : "部屋主の開始を待っています")
-        + "　／　ウォームアップ中は撃てません",
-      (settings ? settingsText(settings) : "") + (inviteCode ? `　招待コード ${inviteCode}（Tab）` : ""),
-    ], false, H - 26); // 自機に重ならないよう画面下に出す
+      t("wait.line1", { mode: t(`mode.${g.mode}`), t: g.t }),
+      t(g.owner ? (touchMode ? "wait.ownerTouch" : "wait.ownerKey") : "wait.guest") + t("wait.noFire"),
+      settings ? settingsText(settings) : "",
+      ...(inviteCode ? [t("wait.invite", { code: inviteCode }).trim()] : []),
+    ], false, inviteCode ? H - 32 : H - 26); // 自機に重ならないよう画面下に出す
   } else if (g.ph === "countdown") {
     banner([String(g.t)], true);
   } else if (g.ph === "roundEnd") {
-    banner([`ラウンド${g.r}　${resultText(g.rr)}`, g.rr === "draw" ? "" : `${TEAM_NAME[g.rr]}の勝ち`]);
+    banner([t("round.result", { r: g.r, result: resultText(g.rr) }), g.rr === "draw" ? "" : t("round.teamWins", { team: t(`team.${g.rr}`) })]);
   } else if (g.ph === "matchEnd") {
     const score = g.mode === "conquest" ? `A ${g.sc[0]} - ${g.sc[1]} B` : `A ${g.w[0]} - ${g.w[1]} B`;
-    banner([`試合終了　${resultText(g.mr)}`, `${score}　まもなく次の試合の待機に戻ります`]);
+    banner([t("match.result", { result: resultText(g.mr) }), t("match.back", { score })]);
   }
   // 観戦の案内（画面下）
-  const note = !me ? "観戦中：次のラウンドから参加します（味方の視点のみ）"
+  const note = !me ? t("note.spectate")
     : me.dead && g.ph === "play"
-      ? (g.mode === "conquest" ? `撃破されました　${curr.rs} 秒後に自陣で復活します` : "撃破されました　味方の視点で観戦中")
+      ? (g.mode === "conquest" ? t("note.respawn", { s: curr.rs }) : t("note.watchAlly"))
       : "";
   if (note) {
     hud.fillStyle = "rgba(0,0,0,0.5)"; hud.fillRect(0, H - 14, W, 14);
@@ -1050,12 +1090,9 @@ function frame() {
   ctx.fillRect(0, 0, W, H);
   hud.clearRect(0, 0, W, H);
   if (!curr || !map.length) {
+    syncSettingsPanel(); // hide room-only panels once we're out of the room
+    syncTouchBar();
     requestAnimationFrame(frame);
-
-// PWA: the service worker lets the game be installed to the home screen (see sw.js)
-if ("serviceWorker" in navigator) {
-  addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* still playable without it */ }));
-}
     return;
   }
   const nowMs = performance.now();
@@ -1095,11 +1132,6 @@ if ("serviceWorker" in navigator) {
   syncSettingsPanel();
   syncTouchBar();
   requestAnimationFrame(frame);
-
-// PWA: the service worker lets the game be installed to the home screen (see sw.js)
-if ("serviceWorker" in navigator) {
-  addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* still playable without it */ }));
-}
 }
 requestAnimationFrame(frame);
 
@@ -1123,7 +1155,7 @@ function setMuted(on) {
   muted = on;
   store.set("ft.mute", on ? "1" : "0");
   if (masterGain) masterGain.gain.value = on ? 0 : SOUND.master;
-  touchBar.querySelector("[data-act=sound]").textContent = on ? "音：オフ" : "音：オン";
+  touchBar.querySelector("[data-act=sound]").textContent = t(on ? "touch.soundOff" : "touch.soundOn");
 }
 addEventListener("keydown", (e) => { if (e.code === "KeyM" && inGame()) setMuted(!muted); });
 setMuted(muted); // show the saved setting on the button

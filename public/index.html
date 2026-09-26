@@ -159,66 +159,67 @@
   <div id="overlay">
     <h1>FLARE TANKS</h1>
     <section id="title">
-      <label id="who">名前 <input id="name" maxlength="12" autocomplete="nickname" placeholder="12文字まで"></label>
-      <div id="tanks" role="group" aria-label="戦車の選択"></div>
+      <label id="who"><span data-i18n="title.name">名前</span> <input id="name" maxlength="12" autocomplete="nickname" placeholder="12文字まで" data-i18n-placeholder="title.namePlaceholder"></label>
+      <button class="btn" id="langBtn" type="button" data-i18n="lang.switch">English</button>
+      <div id="tanks" role="group" aria-label="戦車の選択" data-i18n-aria="title.tanks"></div>
       <div id="err" role="alert"></div>
-      <div id="msg">戦車を選んでロビーへ（1・2・3キーで選択、Enter で決定）</div>
-      <div id="help" class="mouse-only">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン　Tab で参加者一覧　M で消音　Esc で部屋を出る</div>
-      <div id="helpTouch" class="touch-only">左半分をなぞって移動　右半分をなぞって照準（大きく倒すと自動で射撃）　上のボタンでピン</div>
+      <div id="msg" data-i18n="title.msg">戦車を選んでロビーへ（1・2・3キーで選択、Enter で決定）</div>
+      <div id="help" class="mouse-only" data-i18n="title.help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン　Tab で参加者一覧　M で消音　Esc で部屋を出る</div>
+      <div id="helpTouch" class="touch-only" data-i18n="title.helpTouch">左半分をなぞって移動　右半分をなぞって照準（大きく倒すと自動で射撃）　上のボタンでピン</div>
     </section>
-    <section id="lobby" hidden aria-label="ロビー">
+    <section id="lobby" hidden aria-label="ロビー" data-i18n-aria="lobby.aria">
       <div id="lobbyMsg" role="status"></div>
       <div class="row">
-        <button class="btn primary" id="quick" type="button">クイック参加</button>
-        <button class="btn" id="create" type="button">部屋を作る</button>
+        <button class="btn primary" id="quick" type="button" data-i18n="lobby.quick">クイック参加</button>
+        <button class="btn" id="create" type="button" data-i18n="lobby.create">部屋を作る</button>
         <form id="codeForm" class="row">
-          <input id="code" inputmode="numeric" pattern="\d{6}" maxlength="6" placeholder="招待コード" aria-label="招待コード（6桁）">
-          <button class="btn" type="submit">コードで参加</button>
+          <input id="code" inputmode="numeric" pattern="\d{6}" maxlength="6" placeholder="招待コード" aria-label="招待コード（6桁）" data-i18n-placeholder="lobby.codePlaceholder" data-i18n-aria="lobby.codeAria">
+          <button class="btn" type="submit" data-i18n="lobby.joinCode">コードで参加</button>
         </form>
-        <button class="btn" id="rejoin" type="button" hidden>さっきの部屋に戻る</button>
+        <button class="btn" id="rejoin" type="button" hidden data-i18n="lobby.rejoin">さっきの部屋に戻る</button>
       </div>
-      <form id="createForm" hidden aria-label="部屋を作る">
-        <label>モード <select name="mode"><option value="elim">殲滅</option><option value="conquest">拠点制圧</option></select></label>
-        <label>先取ラウンド（殲滅） <select name="winRounds"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
-        <label>マップ <select name="map"><option value="random" selected>自動生成（128×128）</option><option value="basic">標準（40×24）</option></select></label>
-        <label>シード値（空欄はおまかせ） <input name="mapSeed" type="number" min="0" max="2147483647" inputmode="numeric" placeholder="おまかせ"></label>
-        <label>bot の強さ <select name="botLevel"><option value="1">1 入門</option><option value="2">2 初級</option><option value="3" selected>3 標準</option><option value="4">4 上級</option><option value="5">5 達人</option></select></label>
-        <label>フレンドリーファイア <input type="checkbox" name="ff"></label>
-        <label>公開（一覧に表示する） <input type="checkbox" name="public" checked></label>
-        <div class="row"><button class="btn primary" type="submit">作って入る</button><button class="btn" type="button" id="cancelCreate">やめる</button></div>
+      <form id="createForm" hidden aria-label="部屋を作る" data-i18n-aria="set.formAria">
+        <label><span data-i18n="set.mode">モード</span> <select name="mode"><option data-i18n="set.mode.elim" value="elim">殲滅</option><option data-i18n="set.mode.conquest" value="conquest">拠点制圧</option></select></label>
+        <label><span data-i18n="set.winRounds">先取ラウンド（殲滅）</span> <select name="winRounds"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+        <label><span data-i18n="set.map">マップ</span> <select name="map"><option data-i18n="set.map.random" value="random" selected>自動生成（128×128）</option><option data-i18n="set.map.basic" value="basic">標準（40×24）</option></select></label>
+        <label><span data-i18n="set.seedCreate">シード値（空欄はおまかせ）</span> <input name="mapSeed" type="number" min="0" max="2147483647" inputmode="numeric" placeholder="おまかせ" data-i18n-placeholder="set.seedPlaceholder"></label>
+        <label><span data-i18n="set.botLevel">bot の強さ</span> <select name="botLevel"><option value="1" data-i18n="set.level.1">1 入門</option><option value="2" data-i18n="set.level.2">2 初級</option><option value="3" selected data-i18n="set.level.3">3 標準</option><option value="4" data-i18n="set.level.4">4 上級</option><option value="5" data-i18n="set.level.5">5 達人</option></select></label>
+        <label><span data-i18n="set.ff">フレンドリーファイア</span> <input type="checkbox" name="ff"></label>
+        <label><span data-i18n="set.public">公開（一覧に表示する）</span> <input type="checkbox" name="public" checked></label>
+        <div class="row"><button class="btn primary" type="submit" data-i18n="set.submit">作って入る</button><button class="btn" type="button" id="cancelCreate" data-i18n="set.cancel">やめる</button></div>
       </form>
       <div id="humanCheck"></div>
-      <ul id="rooms" aria-label="公開部屋の一覧"></ul>
-      <div class="row"><button class="btn" id="back" type="button">名前・戦車を変える</button></div>
+      <ul id="rooms" aria-label="公開部屋の一覧" data-i18n-aria="lobby.roomsAria"></ul>
+      <div class="row"><button class="btn" id="back" type="button" data-i18n="lobby.back">名前・戦車を変える</button></div>
     </section>
   </div>
-  <div id="touchBar" role="toolbar" aria-label="操作ボタン">
-    <button class="btn" type="button" data-act="pin">ピン</button>
-    <button class="btn primary" type="button" data-act="start" hidden>今すぐ開始</button>
-    <button class="btn" type="button" data-act="settings" hidden>設定</button>
-    <button class="btn" type="button" data-act="players">参加者</button>
-    <button class="btn" type="button" data-act="sound">音：オン</button>
-    <button class="btn" type="button" data-act="leave">退出</button>
+  <div id="touchBar" role="toolbar" aria-label="操作ボタン" data-i18n-aria="touch.aria">
+    <button class="btn" type="button" data-act="pin" data-i18n="touch.pin">ピン</button>
+    <button class="btn primary" type="button" data-act="start" hidden data-i18n="touch.start">今すぐ開始</button>
+    <button class="btn" type="button" data-act="settings" hidden data-i18n="touch.settings">設定</button>
+    <button class="btn" type="button" data-act="players" data-i18n="touch.players">参加者</button>
+    <button class="btn" type="button" data-act="sound" data-i18n="touch.soundOn">音：オン</button>
+    <button class="btn" type="button" data-act="leave" data-i18n="touch.leave">退出</button>
   </div>
-  <div id="rotate" role="alert">横向きにしてください<br>（このゲームは横画面で遊びます）</div>
-  <div id="players" aria-label="参加者一覧">
-    <h2>参加者</h2>
+  <div id="rotate" role="alert"><span data-i18n="rotate.line1">横向きにしてください</span><br><span data-i18n="rotate.line2">（このゲームは横画面で遊びます）</span></div>
+  <div id="players" aria-label="参加者一覧" data-i18n-aria="players.aria">
+    <h2 data-i18n="players.title">参加者</h2>
     <div id="invite"></div>
     <ul id="playerList"></ul>
   </div>
-  <form id="settings" aria-label="部屋の設定">
-    <h2>部屋の設定（部屋主のみ・待機中）</h2>
-    <label>モード
-      <select name="mode"><option value="elim">殲滅</option><option value="conquest">拠点制圧</option></select></label>
-    <label>先取ラウンド（殲滅）
+  <form id="settings" aria-label="部屋の設定" data-i18n-aria="set.panelAria">
+    <h2 data-i18n="set.panelTitle">部屋の設定（部屋主のみ・待機中）</h2>
+    <label><span data-i18n="set.mode">モード</span>
+      <select name="mode"><option data-i18n="set.mode.elim" value="elim">殲滅</option><option data-i18n="set.mode.conquest" value="conquest">拠点制圧</option></select></label>
+    <label><span data-i18n="set.winRounds">先取ラウンド（殲滅）</span>
       <select name="winRounds"><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
-    <label>マップ
-      <select name="map"><option value="random">自動生成（128×128）</option><option value="basic">標準（40×24）</option></select></label>
-    <label>シード値（空欄で新しいマップ）
-      <input name="mapSeed" type="number" min="0" max="2147483647" inputmode="numeric" placeholder="おまかせ"></label>
-    <label>bot の強さ
-      <select name="botLevel"><option value="1">1 入門</option><option value="2">2 初級</option><option value="3">3 標準</option><option value="4">4 上級</option><option value="5">5 達人</option></select></label>
-    <label>フレンドリーファイア <input type="checkbox" name="ff"></label>
+    <label><span data-i18n="set.map">マップ</span>
+      <select name="map"><option data-i18n="set.map.random" value="random">自動生成（128×128）</option><option data-i18n="set.map.basic" value="basic">標準（40×24）</option></select></label>
+    <label><span data-i18n="set.seedPanel">シード値（空欄で新しいマップ）</span>
+      <input name="mapSeed" type="number" min="0" max="2147483647" inputmode="numeric" placeholder="おまかせ" data-i18n-placeholder="set.seedPlaceholder"></label>
+    <label><span data-i18n="set.botLevel">bot の強さ</span>
+      <select name="botLevel"><option value="1" data-i18n="set.level.1">1 入門</option><option value="2" data-i18n="set.level.2">2 初級</option><option value="3" data-i18n="set.level.3">3 標準</option><option value="4" data-i18n="set.level.4">4 上級</option><option value="5" data-i18n="set.level.5">5 達人</option></select></label>
+    <label><span data-i18n="set.ff">フレンドリーファイア</span> <input type="checkbox" name="ff"></label>
   </form>
   <script type="module" src="game.js"></script>
 </body>

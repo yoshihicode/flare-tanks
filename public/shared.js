@@ -6,9 +6,9 @@ export const TILE = 16; // 1タイルのピクセル数
 export const TICK_MS = 50; // サーバー更新間隔（20Hz）
 const DEG = Math.PI / 180;
 // 戦車3種の性能。試遊しながらここだけを調整する（仕様書「戦車3種」の初期値案）
+// Display names and roles are UI text: see public/i18n.js (tank.<type>.name / .role)
 export const TANK_TYPES = {
   light: {
-    name: "軽戦車", role: "偵察・拠点奪取",
     r: 5, // 当たり判定半径（px）
     speed: 90, // 移動速度（px/秒。中戦車の1.5倍）
     hp: 60,
@@ -19,12 +19,10 @@ export const TANK_TYPES = {
     turn: 360 * DEG, // 砲塔の旋回速度（ラジアン/秒）
   },
   medium: {
-    name: "中戦車", role: "万能",
     r: 6, speed: 60, hp: 100, fireInterval: 0.6, damage: 25,
     fov: 90 * DEG, range: 160, turn: 200 * DEG,
   },
   heavy: {
-    name: "重戦車", role: "拠点防衛・撃ち合い",
     r: 7, speed: 36, hp: 160, fireInterval: 1.2, damage: 50,
     fov: 60 * DEG, range: 160, turn: 100 * DEG,
   },

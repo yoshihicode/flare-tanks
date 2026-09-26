@@ -12,6 +12,7 @@ import { sample, pushSnapshot, INTERP } from "../public/interp.js";
 import { minimapLayout, minimapDots, minimapWalls, MINIMAP } from "../public/minimap.js";
 import { readFileSync } from "node:fs";
 import { SFX, FIRE_SFX, synth } from "../public/sfx.js";
+import { STRINGS, LANGS, t as tr, setLang, detectLang } from "../public/i18n.js";
 import { generateMap, assemble, validate, disjointPaths, GEN } from "../src/mapgen.ts";
 import { RANDOM_CHUNKS, BASE_CHUNK, POINT_CHUNK, PLAZA_CHUNK, CHUNK, transform } from "../src/chunks.ts";
 import vm from "node:vm";
@@ -758,6 +759,50 @@ const mapChecks = () => {
   ];
 };
 
+// English / Japanese text (public/i18n.js), checked without a browser
+const i18nChecks = (() => {
+  const JP = /[\u3040-\u30ff\u4e00-\u9fff]/;
+  const [ja, en] = [STRINGS.ja, STRINGS.en];
+  const holes = (v) => [...v.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort().join();
+  const onlyJa = Object.keys(ja).filter((k) => !(k in en));
+  const onlyEn = Object.keys(en).filter((k) => !(k in ja));
+  const holeDiff = Object.keys(ja).filter((k) => k in en && holes(ja[k]) !== holes(en[k]));
+  const jpInEn = Object.entries(en).filter(([k, v]) => k !== "lang.switch" && JP.test(v)).map(([k]) => k);
+  // Keys the client uses: literal t("...") calls, and the families built from values
+  const game = readFileSync(new URL("../public/game.js", import.meta.url), "utf8");
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  const literal = [...game.matchAll(/\bt\(\s*"([\w.]+)"/g)].map((m) => m[1])
+    .concat([...game.matchAll(/busyButton\([^,]+,\s*"([\w.]+)"/g)].map((m) => m[1]))
+    .concat([...game.matchAll(/\bt\([^)]*\?\s*"([\w.]+)"\s*:\s*"([\w.]+)"/g)].flatMap((m) => [m[1], m[2]]));
+  const families = [
+    ...["light", "medium", "heavy"].flatMap((k) => [`tank.${k}.name`, `tank.${k}.role`]),
+    "mode.elim", "mode.conquest", "team.A", "team.B", "close.4000", "close.4003", "close.4404", "close.4005",
+  ];
+  const fromHtml = [...html.matchAll(/data-i18n(?:-placeholder|-aria)?="([\w.]+)"/g)].map((m) => m[1]);
+  const missing = [...new Set([...literal, ...families, ...fromHtml])].filter((k) => !(k in ja));
+  // Japanese left in the page without a key (comments and styles excluded)
+  const body = html.replace(/<!--[\s\S]*?-->/g, "").replace(/<style>[\s\S]*?<\/style>/g, "");
+  const untagged = [...body.matchAll(/<(\w+)([^>]*)>([^<]*)</g)]
+    .filter(([, , attrs, text]) => JP.test(text) && !/data-i18n="/.test(attrs)).map(([, tag, , text]) => `<${tag}>${text.trim()}`)
+    .concat([...body.matchAll(/<\w+([^>]*)>/g)].flatMap(([, attrs]) =>
+      [["placeholder", "data-i18n-placeholder"], ["aria-label", "data-i18n-aria"]]
+        .filter(([a, d]) => new RegExp(`${a}="[^"]*[\\u3040-\\u9fff]`).test(attrs) && !attrs.includes(d)).map(([a]) => a)));
+  setLang("en");
+  const filled = tr("lobby.players", { n: 2, cap: 6 });
+  const fallback = tr("no.such.key");
+  setLang("ja");
+  return [
+    ["多言語：日本語と英語で同じキー", !onlyJa.length && !onlyEn.length, `ja only=${onlyJa.join(",")} en only=${onlyEn.join(",")}`],
+    ["多言語：差し込み値（{n} など）が両言語でそろう", !holeDiff.length, holeDiff.join(",")],
+    ["多言語：英語の文に日本語が混じらない", !jpInEn.length, jpInEn.join(",")],
+    ["多言語：game.js と index.html が使うキーはすべて辞書にある", !missing.length && literal.length > 40, `used=${literal.length} missing=${missing.join(",")}`],
+    ["多言語：index.html にキーの付いていない日本語がない", !untagged.length, untagged.slice(0, 3).join(" ")],
+    ["多言語：ブラウザの言語から判定（日本語以外は英語）", detectLang(["ja-JP", "en"]) === "ja" && detectLang(["en-US", "ja"]) === "en"
+      && detectLang(["fr-FR"]) === "en" && detectLang(["fr", "ja"]) === "ja" && detectLang([]) === "en", ""],
+    ["多言語：差し込み値の埋め込みと、キーがないときの扱い", filled === "2/6 players" && fallback === "no.such.key", filled],
+  ];
+})();
+
 // ===== PWA: manifest, icons and service worker as served by the dev server =====
 const pwaChecks = [];
 const pwaDone = (async () => {
@@ -790,6 +835,11 @@ const pwaDone = (async () => {
   const game = readFileSync(new URL("../public/game.js", import.meta.url), "utf8");
   const imports = [...game.matchAll(/from "\.\/([\w.-]+)"/g)].map((m) => `/${m[1]}`);
   const uncached = imports.filter((f) => !shell.includes(f));
+  // Registered once at the top level (a bad edit once put it inside frame(), adding a listener every frame)
+  const registrations = (game.match(/serviceWorker\.register\(/g) ?? []).length;
+  const frameBody = game.slice(game.indexOf("function frame()"), game.indexOf("\n}\n", game.indexOf("function frame()")));
+  pwaChecks.push(["PWA：Service Worker の登録は1か所だけ（描画ループの中ではない）", registrations === 1 && !frameBody.includes("serviceWorker"),
+    `count=${registrations}`]);
   pwaChecks.push(["PWA：game.js が読み込むファイルはすべて保存対象に入っている", imports.length >= 6 && uncached.length === 0,
     `imports=${imports.length} uncached=${uncached.join(",")}`]);
   pwaChecks.push(["PWA：保存対象のファイルがすべて取得できる（1つでも欠けるとインストールに失敗する）",
@@ -951,6 +1001,7 @@ b.onSnap = (m) => {
     ...clientChecks,
     ...pwaChecks,
     ...sfxChecks,
+    ...i18nChecks,
     ...mapChecks(),
     ["見えた発射には撃った車種が付く（発射音の切り替え用）", st.fireOk > 0 && !st.fireKindNg, `ng=${st.fireKindNg ?? 0}`],
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],

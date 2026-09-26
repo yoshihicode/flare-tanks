@@ -1,9 +1,9 @@
 // Service worker for the PWA (home screen install). Network first, so a new deploy is used right away;
 // the cached copy is only a fallback when offline. Only same-origin page files are handled:
 // the API, WebSockets and third-party scripts (fonts, Turnstile) always go straight to the network.
-const CACHE = "flare-tanks-v2"; // bump when SHELL changes
+const CACHE = "flare-tanks-v3"; // bump when SHELL changes
 const SHELL = [
-  "/", "/index.html", "/game.js", "/shared.js", "/ghosts.js", "/touch.js", "/interp.js", "/minimap.js", "/sfx.js",
+  "/", "/index.html", "/game.js", "/shared.js", "/ghosts.js", "/touch.js", "/interp.js", "/minimap.js", "/sfx.js", "/i18n.js",
   "/manifest.json", "/icons/icon-192.png", "/icons/icon-512.png",
 ];
 
