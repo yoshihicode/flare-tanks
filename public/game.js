@@ -415,7 +415,7 @@ function connect(roomId, adhoc, ts) {
   // Dev-only ad-hoc rooms take their settings from the page URL (?mode=, ?bot=, ...)
   if (adhoc) {
     q.set("adhoc", "1");
-    for (const key of ["mode", "bot", "rounds", "ff"]) if (params.has(key)) q.set(key, params.get(key));
+    for (const key of ["mode", "bot", "rounds", "ff", "map", "seed"]) if (params.has(key)) q.set(key, params.get(key));
   }
   ws = new WebSocket(`${proto}://${location.host}/ws?${q}`);
   ws.onmessage = (ev) => {
