@@ -2,6 +2,7 @@ import { updateGhosts, GHOST } from "./ghosts.js";
 import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "./touch.js";
 import { INTERP, sample, pushSnapshot } from "./interp.js";
 import { MINIMAP, minimapLayout, minimapDots } from "./minimap.js";
+import { SFX, FIRE_SFX, synth } from "./sfx.js";
 import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
@@ -384,6 +385,8 @@ function connect(roomId, adhoc, ts) {
       renderPlayers();
     } else if (m.t === "s") {
       if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
+      else if (curr && m.g.ph === "countdown" && m.g.t !== curr.g.t && m.g.t > 0) play("count"); // 3, 2, 1
+      if (m.hurt.length) play("hurt"); // our own tank was hit
       const nowSec = performance.now() / 1000;
       updateGhosts(ghosts, curr, m, nowSec);
       for (const dir of m.hurt) marks.push({ kind: "hurt", dir, at: nowSec });
@@ -391,7 +394,7 @@ function connect(roomId, adhoc, ts) {
       for (const pin of m.pins) {
         if (seenPins.has(pin.id)) continue;
         seenPins.add(pin.id);
-        if (audio && curr) tone(1200, 1500, 0.08, "square", 0.5); // new pin from the team (skip on first snapshot)
+        if (curr) play("pin"); // new pin from the team (skip on first snapshot)
       }
       prev = curr; curr = m; currAt = performance.now();
       pushSnapshot(snapBuffer, m, currAt);
@@ -622,6 +625,7 @@ touchBar.addEventListener("click", (e) => {
   if (act === "start") ws.send(JSON.stringify({ t: "start" }));
   if (act === "settings") touchSettingsOpen = !touchSettingsOpen;
   if (act === "players") togglePlayers();
+  if (act === "sound") setMuted(!muted);
   if (act === "leave") leaveRoom();
 });
 const roundPoint = (p) => ({ x: Math.round(p.x), y: Math.round(p.y) });
@@ -991,6 +995,7 @@ function drawHud(me) {
   if (g.ph === "play") hud.fillText(fmtTime(g.t), W / 2 + 20, 2);
   // 右：自分の車種とHP
   hud.textAlign = "right";
+  if (muted) { hud.fillStyle = "#8a8778"; hud.fillText(touchMode ? "消音" : "消音（M）", W - 4, 14); } // just under the bar
   if (me) {
     hud.fillStyle = PALETTE.flare;
     hud.fillText(`${tankSpec(me.k).name}  HP ${me.hp}`, W - 4, 2);
@@ -1088,81 +1093,78 @@ if ("serviceWorker" in navigator) {
   addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* still playable without it */ }));
 }
 
-// ===== 効果音（Web Audio APIで合成） =====
+// ===== 効果音（jsfxr 系の設定値から生成して Web Audio API で再生。see sfx.js） =====
 const SOUND = {
   hearDist: 260, // visible events fade out over this distance (px)
   panDist: 160, // horizontal offset (px) at which a sound is fully left/right
   hintVol: [0.8, 0.5, 0.3], // unseen gunfire volume by distance bucket (near, mid, far)
+  master: 0.7, // overall volume
 };
+let muted = store.get("ft.mute") === "1";
+let masterGain = null;
+const buffers = new Map(); // effect name -> AudioBuffer, rendered on first use
 
-// Route a node to the speakers, panned left (-1) .. right (+1) where supported
-function output(node, pan) {
+function setMuted(on) {
+  muted = on;
+  store.set("ft.mute", on ? "1" : "0");
+  if (masterGain) masterGain.gain.value = on ? 0 : SOUND.master;
+  touchBar.querySelector("[data-act=sound]").textContent = on ? "音：オフ" : "音：オン";
+}
+addEventListener("keydown", (e) => { if (e.code === "KeyM" && inGame()) setMuted(!muted); });
+setMuted(muted); // show the saved setting on the button
+
+// Play an effect at a volume (0..1), panned left (-1) .. right (+1) where supported
+function play(name, vol = 1, pan = 0) {
+  if (!audio || vol <= 0) return;
+  if (!masterGain) {
+    masterGain = audio.createGain();
+    masterGain.gain.value = muted ? 0 : SOUND.master;
+    masterGain.connect(audio.destination);
+  }
+  let buf = buffers.get(name);
+  if (!buf) {
+    const samples = synth(SFX[name], audio.sampleRate);
+    buf = audio.createBuffer(1, samples.length, audio.sampleRate);
+    buf.getChannelData(0).set(samples);
+    buffers.set(name, buf);
+  }
+  const src = audio.createBufferSource(), g = audio.createGain();
+  src.buffer = buf;
+  g.gain.value = vol;
+  let node = src.connect(g);
   if (pan && audio.createStereoPanner) {
     const p = audio.createStereoPanner();
     p.pan.value = clamp(pan, -1, 1);
-    node.connect(p).connect(audio.destination);
-  } else {
-    node.connect(audio.destination);
+    node = node.connect(p);
   }
-}
-
-function tone(f1, f2, dur, type, vol, pan = 0) {
-  const t = audio.currentTime;
-  const o = audio.createOscillator(), g = audio.createGain();
-  o.type = type;
-  o.frequency.setValueAtTime(f1, t);
-  o.frequency.exponentialRampToValueAtTime(f2, t + dur);
-  g.gain.setValueAtTime(0.18 * vol, t);
-  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  output(o.connect(g), pan);
-  o.start(t);
-  o.stop(t + dur);
-}
-
-function noise(dur, vol, pan = 0) {
-  const len = Math.floor(audio.sampleRate * dur);
-  const buf = audio.createBuffer(1, len, audio.sampleRate);
-  const d = buf.getChannelData(0);
-  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
-  const src = audio.createBufferSource(), g = audio.createGain();
-  src.buffer = buf;
-  g.gain.value = 0.25 * vol;
-  output(src.connect(g), pan);
+  node.connect(masterGain);
   src.start();
 }
 
 // 試合の段階が変わったときの合図
 function playPhase(g, team) {
-  if (!audio) return;
-  if (g.ph === "countdown") tone(440, 440, 0.12, "square", 0.6);
-  else if (g.ph === "play") tone(880, 880, 0.25, "square", 0.7);
+  if (g.ph === "countdown") play("count");
+  else if (g.ph === "play") play("go");
   else if (g.ph === "roundEnd" || g.ph === "matchEnd") {
     const r = g.ph === "roundEnd" ? g.rr : g.mr;
-    if (r === team) { tone(523, 1046, 0.3, "square", 0.6); } else { tone(400, 120, 0.5, "sawtooth", 0.6); }
+    play(r === team ? "win" : "lose");
   }
 }
 
 function playEvent(e) {
   if (!audio || !curr) return;
   // Capture point changed owner: heard everywhere, rising for us, falling for them
-  if (e.e === "cap") {
-    if (e.team === curr.team) tone(660, 990, 0.25, "triangle", 0.7);
-    else tone(500, 250, 0.3, "triangle", 0.7);
-    return;
-  }
+  if (e.e === "cap") return play(e.team === curr.team ? "capture" : "lost");
   // Unseen gunfire: only a rough direction and distance; a duller shot panned toward it
-  if (e.e === "shot") {
-    tone(520, 130, 0.12, "square", SOUND.hintVol[e.d], Math.cos(e.dir) * 0.9);
-    return;
-  }
+  if (e.e === "shot") return play("hint", SOUND.hintVol[e.d], Math.cos(e.dir) * 0.9);
   // 音の距離は、いま見ている視点（自機、または観戦中の味方）から測る。左右は横方向のずれで振る
   const me = curr.tanks.find((k) => k.id === curr.view);
   const dist = me ? Math.hypot(me.x - e.x, me.y - e.y) : 0;
   const vol = Math.max(0, 1 - dist / SOUND.hearDist); // 遠いほど小さく
   const pan = me ? (e.x - me.x) / SOUND.panDist : 0;
   if (vol <= 0) return;
-  if (e.e === "fire") tone(880, 220, 0.08, "square", vol, pan);
-  else if (e.e === "wall") tone(200, 80, 0.05, "square", vol * 0.5, pan);
-  else if (e.e === "hit") noise(0.12, vol, pan);
-  else if (e.e === "kill") { noise(0.45, vol, pan); tone(300, 40, 0.4, "sawtooth", vol, pan); }
+  if (e.e === "fire") play(FIRE_SFX[e.k] ?? "fireMedium", vol, pan);
+  else if (e.e === "wall") play("wall", vol, pan);
+  else if (e.e === "hit") play("hit", vol, pan);
+  else if (e.e === "kill") play("kill", vol, pan);
 }

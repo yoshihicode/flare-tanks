@@ -11,6 +11,7 @@ import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "../p
 import { sample, pushSnapshot, INTERP } from "../public/interp.js";
 import { minimapLayout, minimapDots, MINIMAP } from "../public/minimap.js";
 import { readFileSync } from "node:fs";
+import { SFX, FIRE_SFX, synth } from "../public/sfx.js";
 import vm from "node:vm";
 import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
 import { LOBBY, pickQuick, expired, newCode, rateLimited, overBudget, publicList } from "../src/lobby.ts";
@@ -610,6 +611,31 @@ const clientChecks = (() => {
   ];
 })();
 
+// Sound effects (public/sfx.js): every effect the game plays exists and renders to sane samples
+const sfxChecks = (() => {
+  const game = readFileSync(new URL("../public/game.js", import.meta.url), "utf8");
+  // Names passed straight to play("..."), and every preset name that appears anywhere in game.js / FIRE_SFX
+  const direct = [...game.matchAll(/play\("(\w+)"/g)].map((m) => m[1]);
+  const missing = direct.filter((n) => !SFX[n]);
+  const unused = Object.keys(SFX).filter((n) => !game.includes(`"${n}"`) && !Object.values(FIRE_SFX).includes(n));
+  const sr = 44100;
+  const bad = [];
+  for (const [name, p] of Object.entries(SFX)) {
+    let seed = 1;
+    const out = synth(p, sr, () => ((seed = (seed * 16807) % 2147483647) / 2147483647));
+    const len = Math.round((p.attack + p.sustain + p.decay) * sr);
+    const peak = out.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+    if (out.length !== len || peak <= 0.02 || peak > 1 || out.some(Number.isNaN)) bad.push(`${name}(peak ${peak.toFixed(2)})`);
+  }
+  const a = synth(SFX.fireLight, sr), b = synth(SFX.fireHeavy, sr);
+  return [
+    ["効果音：鳴らす音にはすべて設定があり、使われない設定もない", missing.length === 0 && unused.length === 0 && direct.length > 5,
+      `missing=${missing.join(",")} unused=${unused.join(",")}`],
+    ["効果音：どの音も長さどおりに生成され、無音でも音割れでもない", bad.length === 0, bad.join(" ")],
+    ["効果音：車種で発射音が違う（重戦車は長く低い）", b.length > a.length, `${a.length} / ${b.length} samples`],
+  ];
+})();
+
 // ===== PWA: manifest, icons and service worker as served by the dev server =====
 const pwaChecks = [];
 const pwaDone = (async () => {
@@ -638,6 +664,12 @@ const pwaDone = (async () => {
   const shell = [...src.matchAll(/"(\/[^"]*)"/g)].map((m) => m[1]).filter((p) => !p.startsWith("/api") && p !== "/ws" && p !== "/lobby");
   const missing = [];
   for (const path of shell) if (!(await get(path)).ok) missing.push(path);
+  // Every module game.js imports must be cached too, or the game can't start offline
+  const game = readFileSync(new URL("../public/game.js", import.meta.url), "utf8");
+  const imports = [...game.matchAll(/from "\.\/([\w.-]+)"/g)].map((m) => `/${m[1]}`);
+  const uncached = imports.filter((f) => !shell.includes(f));
+  pwaChecks.push(["PWA：game.js が読み込むファイルはすべて保存対象に入っている", imports.length >= 6 && uncached.length === 0,
+    `imports=${imports.length} uncached=${uncached.join(",")}`]);
   pwaChecks.push(["PWA：保存対象のファイルがすべて取得できる（1つでも欠けるとインストールに失敗する）",
     shell.length >= 8 && missing.length === 0, `files=${shell.length} missing=${missing.join(",")}`]);
 })();
@@ -717,6 +749,7 @@ b.onSnap = (m) => {
   for (const [x, y] of m.bullets) canSeePoint(grid, view(me), x, y) ? st.bulletOk++ : st.bulletNg++;
   for (const e of m.ev) {
     if (e.e === "fire") canSeePoint(grid, view(me), e.x, e.y) ? st.fireOk++ : st.fireNg++;
+    if (e.e === "fire" && e.k !== "medium") st.fireKindNg = (st.fireKindNg ?? 0) + 1; // only A (medium) shoots
   }
   // Only A shoots, so hints and hit directions should point roughly at A (a.last is from about the same tick)
   const shooter = a.last?.tanks.find((k) => k.id === a.id);
@@ -793,6 +826,8 @@ b.onSnap = (m) => {
     ...touchChecks,
     ...clientChecks,
     ...pwaChecks,
+    ...sfxChecks,
+    ["見えた発射には撃った車種が付く（発射音の切り替え用）", st.fireOk > 0 && !st.fireKindNg, `ng=${st.fireKindNg ?? 0}`],
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);

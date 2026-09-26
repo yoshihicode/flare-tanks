@@ -84,7 +84,8 @@ interface Client {
 interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team; damage: number; owner: string }
 // team：その出来事に関わる戦車のチーム（発射した側・被弾した側・弾の持ち主）。同じチームには常に送る
 // pub: public event sent to everyone regardless of vision (e.g. a capture point changing owner)
-interface GameEvent { e: "fire" | "hit" | "kill" | "wall" | "cap"; x: number; y: number; team: Team; pub?: boolean }
+// k: tank type of the shooter (fire events), so clients play the right gun sound for visible shots
+interface GameEvent { e: "fire" | "hit" | "kill" | "wall" | "cap"; x: number; y: number; team: Team; pub?: boolean; k?: TankType }
 // Capture point. cap runs from -1 (owned by B) to +1 (owned by A)
 interface CapturePoint { id: string; x: number; y: number; cap: number; owner: Team | null; contested: boolean }
 
@@ -719,7 +720,7 @@ export class Room extends DurableObject<Env> {
           vx: Math.cos(t.aim) * BULLET_SPEED, vy: Math.sin(t.aim) * BULLET_SPEED,
           life: BULLET_LIFE, team: t.team, damage: spec.damage, owner: t.id,
         });
-        this.events.push({ e: "fire", x: r1(bx), y: r1(by), team: t.team });
+        this.events.push({ e: "fire", x: r1(bx), y: r1(by), team: t.team, k: t.type });
       }
     }
 
@@ -817,7 +818,7 @@ export class Room extends DurableObject<Env> {
         ...this.events
           .filter((e) => e.pub || e.team === v.team || seen(e.x, e.y))
           // Public events keep their team (who captured); others drop it
-          .map(({ e, x, y, team, pub }) => (pub ? { e, x, y, team } : { e, x, y })),
+          .map(({ e, x, y, team, pub, k }) => (pub ? { e, x, y, team } : k ? { e, x, y, k } : { e, x, y })),
         ...this.shotHints(v),
       ],
       hurt: c.tank ? c.tank.hurt.map(r2) : [], // own tank only: where this tick's hits came from
