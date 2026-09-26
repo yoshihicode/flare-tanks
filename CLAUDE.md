@@ -10,7 +10,7 @@ Cloudflare Workers 無料プランだけで動く、ブラウザ向けトップ�
   - Turnstile は dev では Cloudflare 公式のテスト用の鍵（常に合格。スモークテストは `XXXX.DUMMY.TOKEN.XXXX` を使う）。本番は `TURNSTILE_SITEKEY`・`TURNSTILE_SECRET` を設定する
   - 秘密鍵・Turnstile の鍵が未設定だと、Worker は /ws・/lobby・/api を拒否する（安全でない既定値では動かさない）
   - 開発時だけデバッグ用コマンド（`{t:"dbg"}`：bot停止・段階の残り時間変更・全滅・HP設定・自機の瞬間移動・ポイント設定・拠点の持ち主設定・再接続の確保期限切れ）が有効（`--var DEBUG_TOOLS:1`）。デプロイ版では無効
-- `npm run test:smoke`：自動テスト（dev起動中に別ターミナルで実行、約25秒）。5部屋を並行で使い、撃ち合い・視界・bot・殲滅モードと拠点制圧モードの流れ・ピン・発砲音ヒントを確認する。残像（`public/ghosts.js`）とbot 単体（`scripts/bot-checks.mjs`）の確認も含む
+- `npm run test:smoke`：自動テスト（dev起動中に別ターミナルで実行、約20秒・約110項目）。複数の部屋とロビーを並行で使い、撃ち合い・視界・bot・両モードの流れ・ピン・発砲音ヒント・部屋の設定・ゲスト識別・ロビー・Turnstile・乱用対策を確認する。通信なしの確認（bot 単体 `scripts/bot-checks.mjs`、残像、トークン・名前、ロビーの判断ロジック）も含む
 - `npm run deploy`：Cloudflareへデプロイ（事前に `npx wrangler login`）
 
 ## 構成
