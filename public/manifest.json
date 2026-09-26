@@ -1,8 +1,7 @@
 {
   "name": "FLARE TANKS",
   "short_name": "FLARE TANKS",
-  "description": "ブラウザで遊べるトップビュー2D戦車対戦（3vs3）",
-  "lang": "ja",
+  "description": "Top-down 2D tank battles in the browser (3 vs 3) / ブラウザで遊べるトップビュー2D戦車対戦（3vs3）",
   "start_url": "/",
   "scope": "/",
   "display": "fullscreen",

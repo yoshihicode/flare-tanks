@@ -59,7 +59,8 @@
     /* Landscape only: ask to rotate a phone held upright */
     #rotate {
       position: fixed; inset: 0; display: none; z-index: 10; background: var(--night); color: var(--flare);
-      align-items: center; justify-content: center; text-align: center; font-size: 1.3rem; padding: 2rem;
+      flex-direction: column; gap: 0.5rem; align-items: center; justify-content: center; text-align: center;
+      font-size: 1.3rem; padding: 2rem;
     }
     @media (orientation: portrait) { body.touch #rotate { display: flex; } }
     #overlay h1 {
@@ -201,7 +202,7 @@
     <button class="btn" type="button" data-act="sound" data-i18n="touch.soundOn">音：オン</button>
     <button class="btn" type="button" data-act="leave" data-i18n="touch.leave">退出</button>
   </div>
-  <div id="rotate" role="alert"><span data-i18n="rotate.line1">横向きにしてください</span><br><span data-i18n="rotate.line2">（このゲームは横画面で遊びます）</span></div>
+  <div id="rotate" role="alert"><span data-i18n="rotate.line1">横向きにしてください</span><span data-i18n="rotate.line2">（このゲームは横画面で遊びます）</span></div>
   <div id="players" aria-label="参加者一覧" data-i18n-aria="players.aria">
     <h2 data-i18n="players.title">参加者</h2>
     <div id="invite"></div>
