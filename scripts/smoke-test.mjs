@@ -21,7 +21,8 @@ function join(tank, roomName = room, extra = "") {
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.t === "init") { grid ??= makeGrid(m.map); c.init = m; }
+      if (m.t === "init") { grid ??= makeGrid(m.map); c.init = m; c.settings = m.settings; }
+      else if (m.t === "cfg") { c.settings = m.settings; c.points = m.points; }
       else if (m.t === "s") {
         c.id = m.me; // 観戦中は null
         c.last = m;
@@ -224,6 +225,64 @@ const botCaptureDone = (async () => {
   botCapture.owned = got ? x.last.g.pts.filter((p) => p.o).map((p) => `${p.id}:${p.o}`).join(",") : null;
 })();
 
+// ===== Another room: room settings and friendly fire =====
+const setting = [];
+const sstep = (name, ok, detail = "") => setting.push([name, ok, detail]);
+const settingsDone = (async () => {
+  const room6 = room + "-settings";
+  const p = await join("medium", room6, "&ff=1&rounds=1"); // A, owner
+  const q = await join("medium", room6); // B
+  const r = await join("medium", room6); // A (p's teammate)
+  debug(p, { freezeBots: true });
+  const g = () => p.last.g;
+  sstep("部屋の設定がクエリから反映される", p.settings.ff === true && p.settings.winRounds === 1 && p.settings.mode === "elim",
+    JSON.stringify(p.settings));
+  const set = (c, settings) => c.ws.send(JSON.stringify({ t: "settings", settings }));
+  set(q, { mode: "conquest" });
+  await sleep(300);
+  sstep("部屋主以外は設定を変えられない", p.settings.mode === "elim", `mode=${p.settings.mode}`);
+  set(p, { mode: "conquest", botLevel: 5, winRounds: 9 });
+  await until(() => p.settings.mode === "conquest");
+  sstep("部屋主は待機中に設定を変えられる（不正な値は無視）",
+    p.settings.mode === "conquest" && p.settings.botLevel === 5 && p.settings.winRounds === 1 && q.settings.mode === "conquest"
+      && p.points?.length === 3, JSON.stringify(p.settings));
+  set(p, { mode: "elim" });
+  await until(() => p.settings.mode === "elim");
+
+  await startNow(p);
+  set(p, { mode: "conquest" });
+  await sleep(300);
+  sstep("対戦中は設定を変えられない", p.settings.mode === "elim", `mode=${p.settings.mode}`);
+
+  // Friendly fire on: p shoots east into r standing 40 px away
+  const shootAlly = async () => {
+    const me = p.last.tanks.find((k) => k.id === p.id);
+    debug(r, { moveX: me.x + 40, moveY: me.y });
+    await sleep(200);
+    const hp0 = p.last.tanks.find((k) => k.id === r.id).hp;
+    send(p, { mx: 0, my: 0, aim: 0, fire: true });
+    await sleep(900);
+    send(p, { mx: 0, my: 0, aim: 0, fire: false });
+    await sleep(300);
+    return { lost: hp0 - p.last.tanks.find((k) => k.id === r.id).hp, self: p.last.tanks.find((k) => k.id === p.id).hp };
+  };
+  const on = await shootAlly();
+  sstep("フレンドリーファイアありなら味方に当たる（自分には当たらない）", on.lost > 0 && on.self === tankSpec("medium").hp,
+    `ally lost ${on.lost}hp, self ${on.self}hp`);
+
+  debug(p, { killTeam: "B" });
+  await until(() => g().ph === "roundEnd");
+  debug(p, { phaseSec: 0 });
+  sstep("1ラウンド先取の設定なら1勝で試合終了", await until(() => g().ph === "matchEnd" && g().mr === "A"), `ph=${g().ph} w=${g().w}`);
+  debug(p, { phaseSec: 0 });
+  await until(() => g().ph === "wait");
+  set(p, { ff: false });
+  await until(() => p.settings.ff === false);
+  await startNow(p);
+  const off = await shootAlly();
+  sstep("フレンドリーファイアなしなら味方に当たらない", off.lost === 0, `ally lost ${off.lost}hp`);
+})();
+
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
 function inPolygon(pts, x, y) {
   let inside = false;
@@ -370,6 +429,7 @@ setTimeout(async () => {
   await flowDone;
   await conquestDone;
   await botCaptureDone;
+  await settingsDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
@@ -379,6 +439,7 @@ setTimeout(async () => {
     ...botChecks(),
     ...flow,
     ...conquest,
+    ...setting,
     ["拠点制圧：bot が自分で拠点を取る", botCapture.owned !== null, `owned=${botCapture.owned}`],
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],

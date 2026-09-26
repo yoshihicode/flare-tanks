@@ -151,5 +151,21 @@ export function botChecks() {
     const { firstFire } = run(makeBot(3), self, { sec: 3, objectives, see: () => [enemy] });
     checks.push(["拠点制圧：敵が見えたら拠点より交戦を優先", firstFire !== null, `firstFire=${firstFire?.toFixed(2)}s`]);
   }
+  // Friendly fire on: an ally in the line of fire holds the shot; with it off the bot fires through
+  const throughAlly = (ff) => {
+    const self = tank("b", "A", at(10, 10));
+    const ally = tank("x", "A", at(13, 10));
+    const enemy = tank("e", "B", at(17, 10));
+    const bot = makeBot(5);
+    let fired = false;
+    for (let i = 0; i < 40; i++) {
+      const input = bot.think({ self, allies: [ally], enemies: [enemy], hit: null, now: i * DT, ff });
+      self.aim = turnTurret(self.type, self.aim, input.aim, DT);
+      if (input.fire) fired = true;
+    }
+    return fired;
+  };
+  const ffOn = throughAlly(true), ffOff = throughAlly(false);
+  checks.push(["フレンドリーファイアありなら味方越しに撃たない", !ffOn && ffOff, `ff on fired=${ffOn} / off fired=${ffOff}`]);
   return checks;
 }

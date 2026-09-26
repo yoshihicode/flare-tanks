@@ -44,6 +44,16 @@
     #tanks button small { opacity: 0.75; }
     #tanks button[aria-pressed="true"] { border-color: var(--flare); background: rgba(255, 179, 71, 0.12); }
     #tanks button:focus-visible { outline: 2px solid var(--flare); outline-offset: 2px; }
+    /* Room settings panel: shown to the room owner while waiting */
+    #settings {
+      position: absolute; top: 3.2rem; right: 1rem; display: none;
+      background: rgba(10, 14, 11, 0.9); border: 2px solid #4a483e; padding: 0.6rem 0.8rem;
+      font-size: 0.9rem; line-height: 2; min-width: 14rem;
+    }
+    #settings h2 { margin: 0 0 0.2rem; font-size: 1rem; font-weight: 400; color: var(--flare); }
+    #settings label { display: flex; justify-content: space-between; gap: 1rem; }
+    #settings select, #settings input { font: inherit; color: var(--ash); background: #1b2419; border: 1px solid #4a483e; }
+    #settings select:focus-visible, #settings input:focus-visible { outline: 2px solid var(--flare); }
     @media (prefers-reduced-motion: no-preference) {
       #overlay h1 { animation: flicker 3s infinite; }
       @keyframes flicker { 0%, 92%, 100% { opacity: 1 } 94% { opacity: 0.7 } 96% { opacity: 1 } 98% { opacity: 0.8 } }
@@ -59,6 +69,16 @@
     <div id="msg">戦車を選んで出撃（1・2・3キーでも選べます）</div>
     <div id="help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン（敵発見を味方に知らせる）</div>
   </div>
+  <form id="settings" aria-label="部屋の設定">
+    <h2>部屋の設定（部屋主のみ・待機中）</h2>
+    <label>モード
+      <select name="mode"><option value="elim">殲滅</option><option value="conquest">拠点制圧</option></select></label>
+    <label>先取ラウンド（殲滅）
+      <select name="winRounds"><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></label>
+    <label>bot の強さ
+      <select name="botLevel"><option value="1">1 入門</option><option value="2">2 初級</option><option value="3">3 標準</option><option value="4">4 上級</option><option value="5">5 達人</option></select></label>
+    <label>フレンドリーファイア <input type="checkbox" name="ff"></label>
+  </form>
   <script type="module" src="game.js"></script>
 </body>
 </html>

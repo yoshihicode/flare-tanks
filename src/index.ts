@@ -5,6 +5,7 @@ import {
   stepTank, turnTurret, canSeePoint, canSeeTank,
 } from "../public/shared.js";
 import { Bot, type Pin } from "./bot.ts";
+import { DEFAULT_SETTINGS, parseSettings, settingsFromQuery, type RoomSettings } from "./settings.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
 const TEAM_SIZE = 3; // 1チームの台数（3vs3）。空いた枠は bot が埋める
@@ -17,8 +18,7 @@ const MATCH = {
   roundSec: 600, // 1ラウンドの制限時間（10分）
   roundEndSec: 4, // ラウンド結果の表示時間
   matchEndSec: 8, // 試合結果の表示時間。その後は同じ部屋で次の試合の待機に戻る
-  winRounds: 2, // 2ラウンド先取
-  maxRounds: 3,
+  // Rounds to win come from the room settings (default 2); max rounds = 2 * winRounds - 1
 };
 // Conquest mode (spec "ゲームモード" / "拠点制圧のルール")
 const CONQUEST = {
@@ -41,11 +41,8 @@ const HINT = {
   near: 160, // distance buckets: 0 = within near, 1 = within mid, 2 = beyond
   mid: 320,
 };
-type Mode = "elim" | "conquest";
-const MODE_DEFAULT: Mode = "elim";
 type Phase = "wait" | "countdown" | "play" | "roundEnd" | "matchEnd";
 type Result = Team | "draw";
-const BOT_LEVEL_DEFAULT = 3; // bot の強さ（1〜5）。部屋を作った人の指定がなければこれ
 // bot の枠の車種（チームごとに同じ並び）
 const BOT_TYPES: TankType[] = ["medium", "light", "heavy"];
 
@@ -75,7 +72,7 @@ interface Client {
   tank: Tank | null; // null の間は観戦（対戦中に入った人は次のラウンドから参加）
   seq: number; // 最後に受け取った入力の確認番号（クライアントの予測補正用に返す）
 }
-interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team; damage: number }
+interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team; damage: number; owner: string }
 // team：その出来事に関わる戦車のチーム（発射した側・被弾した側・弾の持ち主）。同じチームには常に送る
 // pub: public event sent to everyone regardless of vision (e.g. a capture point changing owner)
 interface GameEvent { e: "fire" | "hit" | "kill" | "wall" | "cap"; x: number; y: number; team: Team; pub?: boolean }
@@ -160,8 +157,8 @@ export class Room extends DurableObject<Env> {
   bullets: Bullet[] = [];
   events: GameEvent[] = [];
   timer: ReturnType<typeof setInterval> | null = null;
-  botLevel = BOT_LEVEL_DEFAULT;
-  mode: Mode = MODE_DEFAULT;
+  settings: RoomSettings = DEFAULT_SETTINGS;
+  get mode() { return this.settings.mode; }
   points: CapturePoint[] = [];
   score: Record<Team, number> = { A: 0, B: 0 };
   lastTickAt = 0; // wall-clock time of the previous tick (s)
@@ -179,7 +176,7 @@ export class Room extends DurableObject<Env> {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     // 最初の1人が来たときに6枠を bot で用意する（部屋の設定は最初の人の指定を使う）
-    if (this.clients.size === 0) this.setupRoom(Number(url.searchParams.get("bot")), url.searchParams.get("mode"));
+    if (this.clients.size === 0) this.setupRoom(settingsFromQuery(url.searchParams));
     const type = toTankType(url.searchParams.get("tank"));
     const team = this.pickTeam();
     if (!team) return new Response("満員です", { status: 503 });
@@ -199,17 +196,21 @@ export class Room extends DurableObject<Env> {
     server.addEventListener("close", leave);
     server.addEventListener("error", leave);
 
-    server.send(JSON.stringify({
-      t: "init", id: c.id, tile: TILE, map: MAP, mode: this.mode,
-      points: this.mode === "conquest" ? POINTS.map((p) => ({ ...p, r: CONQUEST.radius })) : [],
-    }));
+    server.send(JSON.stringify({ t: "init", id: c.id, tile: TILE, map: MAP, ...this.config() }));
     this.startLoop();
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  setupRoom(botLevel: number, mode: string | null) {
-    this.botLevel = Number.isInteger(botLevel) && botLevel >= 1 && botLevel <= 5 ? botLevel : BOT_LEVEL_DEFAULT;
-    this.mode = mode === "conquest" || mode === "elim" ? mode : MODE_DEFAULT;
+  // Settings and the capture points they imply; sent in init and whenever the owner changes settings
+  config() {
+    return {
+      settings: this.settings,
+      points: this.mode === "conquest" ? POINTS.map((p) => ({ ...p, r: CONQUEST.radius })) : [],
+    };
+  }
+
+  setupRoom(settings: RoomSettings) {
+    this.settings = settings;
     this.debug = { freezeBots: false };
     this.newMatch(Date.now() / 1000);
     this.bullets = [];
@@ -232,7 +233,7 @@ export class Room extends DurableObject<Env> {
   newBot(t: Tank): Bot {
     const home = spawnPoint(t.team, 1);
     const enemyHome = spawnPoint(t.team === "A" ? "B" : "A", 1);
-    return new Bot(this.botLevel, GRID, { home, enemyHome, bulletSpeed: BULLET_SPEED });
+    return new Bot(this.settings.botLevel, GRID, { home, enemyHome, bulletSpeed: BULLET_SPEED });
   }
 
   // 人間の少ないチームへ入れる（同数ならA）。両チームとも人間で埋まっていれば null（満員）
@@ -289,6 +290,11 @@ export class Room extends DurableObject<Env> {
     let m: any;
     try { m = JSON.parse(data); } catch { return; }
     if (m?.t === "dbg") return this.onDebug(m, c);
+    // The owner may change room settings, but only while waiting (spec: mode is fixed during a match)
+    if (m?.t === "settings") {
+      if (c === this.owner && this.phase === "wait") this.applySettings(parseSettings(m.settings, this.settings));
+      return;
+    }
     // 部屋主は待機中にすぐ開始できる
     if (m?.t === "start") {
       if (c === this.owner && this.phase === "wait") this.startRound(Date.now() / 1000);
@@ -327,6 +333,18 @@ export class Room extends DurableObject<Env> {
     }
     const p = this.points.find((p) => p.id === m.own?.id);
     if (p && (m.own.team === "A" || m.own.team === "B")) { p.owner = m.own.team; p.cap = m.own.team === "A" ? 1 : -1; }
+  }
+
+  applySettings(next: RoomSettings) {
+    const modeChanged = next.mode !== this.settings.mode;
+    const levelChanged = next.botLevel !== this.settings.botLevel;
+    this.settings = next;
+    if (modeChanged) this.resetPoints();
+    if (levelChanged) for (const t of this.tanks) if (t.bot) t.bot = this.newBot(t);
+    const msg = JSON.stringify({ t: "cfg", ...this.config() });
+    for (const c of this.clients.values()) {
+      try { c.ws.send(msg); } catch { /* closed sockets are handled by the close event */ }
+    }
   }
 
   // ===== 試合の進行（殲滅モード） =====
@@ -391,7 +409,8 @@ export class Room extends DurableObject<Env> {
       this.phaseEndsAt = now + (this.mode === "conquest" ? CONQUEST.roundSec : MATCH.roundSec);
     }
     else if (this.phase === "roundEnd") {
-      const done = this.wins.A >= MATCH.winRounds || this.wins.B >= MATCH.winRounds || this.round >= MATCH.maxRounds;
+      const win = this.settings.winRounds;
+      const done = this.wins.A >= win || this.wins.B >= win || this.round >= win * 2 - 1;
       if (done) {
         this.endMatch(now, this.wins.A > this.wins.B ? "A" : this.wins.B > this.wins.A ? "B" : "draw");
       } else {
@@ -468,7 +487,7 @@ export class Room extends DurableObject<Env> {
       if (this.debug.freezeBots) { t.input = { ...IDLE, aim: t.aim }; continue; }
       const enemies = this.tanks.filter((e) => e.team !== t.team && !e.dead && canSeeTank(GRID, t, e));
       const allies = this.tanks.filter((a) => a.team === t.team && a !== t);
-      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now, objectives, pins: this.pins[t.team] });
+      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now, objectives, pins: this.pins[t.team], ff: this.settings.ff });
       if (t.input.pin) this.addPin(t, t.input.pin.x, t.input.pin.y, now);
     }
   }
@@ -504,13 +523,13 @@ export class Room extends DurableObject<Env> {
         this.bullets.push({
           x: bx, y: by,
           vx: Math.cos(t.aim) * BULLET_SPEED, vy: Math.sin(t.aim) * BULLET_SPEED,
-          life: BULLET_LIFE, team: t.team, damage: spec.damage,
+          life: BULLET_LIFE, team: t.team, damage: spec.damage, owner: t.id,
         });
         this.events.push({ e: "fire", x: r1(bx), y: r1(by), team: t.team });
       }
     }
 
-    // 弾の移動と当たり判定（フレンドリーファイアの設定はステップ5で追加）
+    // 弾の移動と当たり判定。Teammates are hit only with friendly fire on; a bullet never hits its shooter
     this.bullets = this.bullets.filter((b) => {
       b.x += b.vx * dt;
       b.y += b.vy * dt;
@@ -521,7 +540,7 @@ export class Room extends DurableObject<Env> {
         return false;
       }
       for (const t of this.tanks) {
-        if (t.dead || t.team === b.team) continue;
+        if (t.dead || t.id === b.owner || (t.team === b.team && !this.settings.ff)) continue;
         if (Math.hypot(t.x - b.x, t.y - b.y) < tankSpec(t.type).r + 2) {
           t.hp = Math.max(0, t.hp - b.damage);
           t.hit = { dir: Math.atan2(-b.vy, -b.vx), at: now };
@@ -582,7 +601,7 @@ export class Room extends DurableObject<Env> {
       // 試合の状態（座標は含まないので全員に送る）
       g: {
         ph: this.phase, t: Math.max(0, Math.ceil(this.phaseEndsAt - now)), r: this.round,
-        w: [this.wins.A, this.wins.B], wr: MATCH.winRounds, al: [alive("A"), alive("B")],
+        w: [this.wins.A, this.wins.B], wr: this.settings.winRounds, al: [alive("A"), alive("B")],
         rr: this.roundResult, mr: this.matchResult, owner: c === this.owner,
         mode: this.mode,
         // Conquest: scores and capture point states (no coordinates, so public)

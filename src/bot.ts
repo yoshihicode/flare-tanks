@@ -20,6 +20,7 @@ export interface Perception {
   now: number; // 秒
   objectives?: Objective[]; // conquest mode only: capture point states (public info, no enemy positions)
   pins?: Pin[]; // active pins of our own team
+  ff?: boolean; // friendly fire is on: don't shoot through allies
 }
 export interface Objective { id: string; x: number; y: number; r: number; owner: string | null; contested: boolean }
 export interface BotOptions {
@@ -53,6 +54,7 @@ const BOT = {
   memorySec: 6, // 見失った敵の位置を覚えている時間
   intelSec: 4, // 共有された発見情報を信じる時間
   pinSec: 2, // Lv5: minimum interval between pins while tracking an enemy
+  ffMargin: 4, // friendly fire on: extra clearance (px) an ally needs from the line of fire
   hitMemorySec: 2, // 撃たれた方向へ振り向き続ける時間
   lostResetSec: 1, // これ以上見失ったら、再発見時に反応時間をやり直す
   ambushChance: 0.35, // 巡回の目的地に着いたとき待ち伏せする確率
@@ -167,7 +169,8 @@ export class Bot {
       aim = this.aimAt(s, target, p.now);
       const ready = p.now - this.spottedAt >= this.cfg.reaction;
       const aligned = Math.abs(angleDiff(s.aim, aim)) < BOT.fireCone;
-      fire = ready && aligned && lineOfSight(this.grid, s.x, s.y, target.x, target.y);
+      fire = ready && aligned && lineOfSight(this.grid, s.x, s.y, target.x, target.y)
+        && !(p.ff && this.allyInLine(s, target, p.allies));
     } else if (p.hit && p.now - p.hit.at < BOT.hitMemorySec) {
       aim = p.hit.dir; // 見えない相手に撃たれたら、撃たれた方向を向く
     }
@@ -308,6 +311,18 @@ export class Bot {
     const vx = (-dy / d) * this.strafe + (dx / d) * back;
     const vy = (dx / d) * this.strafe + (dy / d) * back;
     return { mx: Math.abs(vx) > 0.38 ? Math.sign(vx) : 0, my: Math.abs(vy) > 0.38 ? Math.sign(vy) : 0 };
+  }
+
+  // True if a live ally is on the segment from s to t (with a small margin), closer than the target
+  allyInLine(s: TankView, t: TankView, allies: TankView[]): boolean {
+    const dx = t.x - s.x, dy = t.y - s.y, len2 = dx * dx + dy * dy || 1;
+    return allies.some((a) => {
+      if (a.dead || a.id === s.id) return false;
+      const u = ((a.x - s.x) * dx + (a.y - s.y) * dy) / len2;
+      if (u <= 0 || u >= 1) return false;
+      const px = s.x + dx * u, py = s.y + dy * u;
+      return Math.hypot(a.x - px, a.y - py) < tankSpec(a.type).r + BOT.ffMargin;
+    });
   }
 
   // Newest recent pin placed by someone else on the team (Lv5 only)

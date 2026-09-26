@@ -45,6 +45,7 @@ const fog = fogCv.getContext("2d");
 // ===== 状態 =====
 let ws = null, myId = null, map = [], grid = null;
 let points = []; // capture points {id, x, y, r} (conquest mode only; states come in each snapshot)
+let settings = null; // room settings from the server (init / cfg)
 const seenPins = new Set(); // pin ids already announced with a sound
 const ghosts = new Map(); // last-seen afterimages of enemies (see ghosts.js)
 let marks = []; // edge indicators: {kind: "hurt" | "shot", dir, d, at}
@@ -126,7 +127,10 @@ function connect() {
     if (m.t === "init") {
       myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
       points = m.points || [];
+      settings = m.settings;
       ghosts.clear(); marks = [];
+    } else if (m.t === "cfg") {
+      settings = m.settings; points = m.points || [];
       pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
       if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
@@ -358,6 +362,29 @@ const fmtTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2,
 const resultText = (r) => (r === "draw" ? "引き分け" : r === curr.team ? "勝利" : "敗北");
 
 const MODE_NAME = { elim: "殲滅モード", conquest: "拠点制圧モード" };
+
+// ===== Room settings panel (owner, waiting phase only) =====
+const settingsForm = document.getElementById("settings");
+settingsForm.addEventListener("change", () => {
+  const f = settingsForm.elements;
+  const next = { mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value), ff: f.ff.checked };
+  ws?.send(JSON.stringify({ t: "settings", settings: next }));
+});
+settingsForm.addEventListener("submit", (e) => e.preventDefault());
+// Keep the panel's visibility and values in sync with the server (skipping a field being edited)
+function syncSettingsPanel() {
+  const show = !!(curr && settings && curr.g.ph === "wait" && curr.g.owner && overlay.style.display === "none");
+  settingsForm.style.display = show ? "block" : "none";
+  if (!show) return;
+  const f = settingsForm.elements;
+  for (const [name, value] of Object.entries(settings)) {
+    const el = f[name];
+    if (!el || el === document.activeElement) continue;
+    if (el.type === "checkbox") el.checked = value; else el.value = String(value);
+  }
+}
+const settingsText = (s) =>
+  `${s.mode === "elim" ? `${s.winRounds}ラウンド先取` : `${curr.g.tg}pt先取`}・bot Lv${s.botLevel}・フレンドリーファイア${s.ff ? "あり" : "なし"}`;
 const ownerColor = (o) => (o ? PALETTE[o] : "#8a8778");
 
 // Capture zones: ring in the owner's color, arc = capture progress of the leading team.
@@ -504,7 +531,8 @@ function drawHud(me) {
     banner([
       `${MODE_NAME[g.mode]}　待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
       g.owner ? "Enter キーで今すぐ開始　／　ウォームアップ中は撃てません" : "部屋主の開始を待っています　／　ウォームアップ中は撃てません",
-    ], false, H - 20); // 自機に重ならないよう画面下に出す
+      settings ? settingsText(settings) : "",
+    ], false, H - 26); // 自機に重ならないよう画面下に出す
   } else if (g.ph === "countdown") {
     banner([String(g.t)], true);
   } else if (g.ph === "roundEnd") {
@@ -563,6 +591,7 @@ function frame() {
   drawMarks(view);
   drawPointLabels();
   drawHud(me);
+  syncSettingsPanel();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
