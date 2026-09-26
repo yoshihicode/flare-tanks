@@ -8,9 +8,15 @@ import {
 import { botChecks } from "./bot-checks.mjs";
 import { updateGhosts, GHOST } from "../public/ghosts.js";
 import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
+import { LOBBY, pickQuick, expired, newCode, rateLimited, overBudget, publicList } from "../src/lobby.ts";
+import { DEFAULT_SETTINGS } from "../src/settings.ts";
 
 const BASE = process.env.WS_URL || "ws://localhost:8787/ws";
 const HTTP = BASE.replace(/^ws/, "http").replace(/\/ws$/, "");
+// Turnstile: npm run dev uses Cloudflare's always-pass test keys, which accept this dummy token
+const TS = "XXXX.DUMMY.TOKEN.XXXX";
+// Each run poses as its own IP (dev only) so the per-IP room creation limit doesn't carry over between runs
+const TEST_IP = `10.${Date.now() % 250}.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250)}`;
 // Get a signed guest token (spec: guest identity). Returns {status, body}
 async function guest(name, token) {
   const res = await fetch(`${HTTP}/api/guest`, { method: "POST", body: JSON.stringify({ name, token }) });
@@ -28,7 +34,7 @@ async function join(tank, roomName = room, extra = "", who = {}) {
   const name = who.name ?? "tester";
   const token = who.token ?? (await guest(name)).body.token;
   return new Promise((resolve, reject) => {
-    const q = new URLSearchParams({ room: roomName, tank, token, name });
+    const q = new URLSearchParams({ room: roomName, tank, token, name, ts: TS });
     if (!who.lobby) q.set("adhoc", "1");
     const c = { ws: new WebSocket(`${BASE}?${q}${extra}`), id: null, onSnap: null, token, name };
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
@@ -302,6 +308,7 @@ async function tryJoin(roomName, who = {}) {
   const token = who.token ?? (await guest("x")).body.token;
   const q = new URLSearchParams({ room: roomName, tank: "medium", token, name: who.name ?? "x" });
   if (who.adhoc) q.set("adhoc", "1");
+  if (!who.noTs) q.set("ts", TS);
   return new Promise((resolve) => {
     const ws = new WebSocket(`${BASE}?${q}`);
     ws.onmessage = (e) => { if (JSON.parse(e.data).t === "s") { resolve("ok"); ws.close(); } };
@@ -315,8 +322,8 @@ const lobbyChecks = [];
 const lstep = (name, ok, detail = "") => lobbyChecks.push([name, ok, detail]);
 const lobbyDone = (async () => {
   const token = (await guest("lobbyist")).body.token;
-  const api = async (path, body) => {
-    const r = await fetch(`${HTTP}${path}`, { method: "POST", body: JSON.stringify({ token, ...body }) });
+  const api = async (path, body, ip = TEST_IP) => {
+    const r = await fetch(`${HTTP}${path}`, { method: "POST", headers: { "X-Test-IP": ip }, body: JSON.stringify({ token, ts: TS, ...body }) });
     return { status: r.status, body: await r.json() };
   };
   const lists = [];
@@ -325,8 +332,14 @@ const lobbyDone = (async () => {
   lstep("ロビー：接続すると部屋一覧が届く", await until(() => lists[0]?.t === "rooms" && Array.isArray(lists[0].rooms)));
   const listed = (id) => lists.at(-1)?.rooms.find((r) => r.id === id);
 
-  const unauth = await fetch(`${HTTP}/api/rooms`, { method: "POST", body: JSON.stringify({ token: "bad" }) });
+  const unauth = await fetch(`${HTTP}/api/rooms`, { method: "POST", body: JSON.stringify({ token: "bad", ts: TS }) });
   lstep("トークンなしでは部屋を作れない", unauth.status === 401, `status=${unauth.status}`);
+  const config = await (await fetch(`${HTTP}/api/config`)).json();
+  lstep("Turnstile のサイトキーを配る", typeof config.turnstileSiteKey === "string" && config.turnstileSiteKey.length > 0);
+  const noTs = await api("/api/rooms", { ts: "" });
+  const noTsQuick = await api("/api/quick", { ts: undefined });
+  lstep("Turnstile の確認なしでは部屋を作れない（クイック参加も）", noTs.status === 403 && noTsQuick.status === 403,
+    `${noTs.status}/${noTsQuick.status}`);
   const pub = (await api("/api/rooms", { settings: { mode: "conquest", botLevel: 2, public: true } })).body;
   lstep("公開部屋を作ると一覧に配信される", await until(() => listed(pub.id)?.mode === "conquest" && listed(pub.id)?.humans === 0),
     JSON.stringify(listed(pub.id)));
@@ -342,6 +355,7 @@ const lobbyDone = (async () => {
     p.settings.mode === "conquest" && p.settings.botLevel === 2 && p.init.code === pub.code, JSON.stringify(p.settings));
   lstep("入ると一覧の人数が増える", await until(() => listed(pub.id)?.humans === 1), JSON.stringify(listed(pub.id)));
   lstep("ロビーを通さない部屋には入れない（本番の動作）", (await tryJoin(`nope-${Date.now()}`)) === 4404);
+  lstep("Turnstile の確認なしでは部屋に入れない", (await tryJoin(pub.id, { noTs: true })) !== "ok");
   const pv = await join("medium", priv.id, "", { lobby: true });
   lstep("非公開部屋にも入れる（設定が反映）", pv.settings.ff === true && pv.settings.public === false);
 
@@ -371,6 +385,61 @@ const lobbyDone = (async () => {
   lstep("閉じた部屋の古いリンクでは入れない", (await tryJoin(pub.id)) === 4404);
   pv.ws.close();
   watcher.close();
+
+  // Per-IP creation limit (a fresh fake IP so earlier creations in this run don't count)
+  const ip2 = TEST_IP + "-limit";
+  const statuses = [];
+  for (let i = 0; i <= LOBBY.createLimit; i++) statuses.push((await api("/api/rooms", { settings: { public: false } }, ip2)).status);
+  lstep(`同じ接続元からの部屋作成は${LOBBY.createWindowSec / 60}分に${LOBBY.createLimit}回まで`,
+    statuses.slice(0, -1).every((x) => x === 200) && statuses.at(-1) === 429, statuses.join(","));
+
+  // Rooms report incoming message counts to the lobby's daily total
+  const post = (path, body) => fetch(`${HTTP}${path}`, { method: "POST", body: JSON.stringify(body) });
+  const usage = async () => (await (await post("/api/debug/usage", {})).json()).value;
+  const counter = await join("medium", room + "-usage");
+  debug(counter, { reportUsage: true }); // flush what's been counted so far (this message included)
+  await sleep(300);
+  const u0 = await usage();
+  for (let i = 0; i < 30; i++) send(counter, { mx: i % 2, my: 0 });
+  debug(counter, { reportUsage: true });
+  await sleep(500);
+  const u1 = await usage();
+  lstep("部屋が受信メッセージ数をロビーに報告する", u1 - u0 >= 31, `+${u1 - u0}（送信31件）`);
+  counter.ws.close();
+
+  // Daily message budget: pretend today's total is past the cutoff, then restore it
+  await post("/api/debug/usage", { value: LOBBY.dailyMessages * LOBBY.stopRatio });
+  const over = await api("/api/rooms", { settings: { public: false } }, ip2 + "-b");
+  await post("/api/debug/usage", { value: 0 });
+  const after = await api("/api/rooms", { settings: { public: false } }, ip2 + "-b");
+  lstep("受信メッセージが1日の上限に近いと新しい部屋を作れない", over.status === 503 && after.status === 200, `${over.status} -> ${after.status}`);
+})();
+
+// Lobby rules without the server
+const lobbyLogic = (() => {
+  const now = 10_000;
+  const r = (id, extra = {}, set = {}) => ({ id, code: id, humans: 1, phase: "wait", createdAt: now, updatedAt: now,
+    settings: { ...DEFAULT_SETTINGS, ...set }, ...extra });
+  const rooms = [
+    r("full", { humans: 6 }), r("private", {}, { public: false }), r("elimPlay", { phase: "play", humans: 4 }),
+    r("conqPlay", { phase: "play" }, { mode: "conquest" }), r("wait1"), r("wait3", { humans: 3 }),
+  ];
+  const codes = new Set(Array.from({ length: 300 }, () => newCode(rooms)));
+  let seq = 0;
+  const fixed = () => [0.123456, 0.123456, 0.654321][seq++ % 3];
+  return [
+    ["ロビー：クイック参加は待機中で人の多い部屋→拠点制圧の対戦中→その他の順", pickQuick(rooms)?.id === "wait3"
+      && pickQuick(rooms.filter((x) => x.phase !== "wait"))?.id === "conqPlay", ""],
+    ["ロビー：一覧に非公開部屋と招待コードは出ない", publicList(rooms).every((x) => x.id !== "private" && !("code" in x)), ""],
+    ["ロビー：だれも入らない部屋と通知の途絶えた部屋を片付ける", expired([
+      r("idle", { humans: 0, updatedAt: now - LOBBY.idleSec - 1 }), r("fresh", { humans: 0 }),
+      r("stale", { updatedAt: now - LOBBY.staleSec - 1 })], now).map((x) => x.id).join() === "idle,stale", ""],
+    ["ロビー：招待コードは6桁で使用中と重ならない", [...codes].every((c) => /^\d{6}$/.test(c))
+      && newCode([r("x", { code: "123456" })], fixed) === "654321", ""],
+    ["ロビー：作成回数の上限と日ごとの上限の判定", rateLimited(Array(LOBBY.createLimit).fill(now), now) === null
+      && rateLimited(Array(LOBBY.createLimit).fill(now - LOBBY.createWindowSec), now)?.length === 1
+      && overBudget(LOBBY.dailyMessages) && !overBudget(0), ""],
+  ];
 })();
 
 // ===== Guest identity: offline checks of src/guest.ts, then the API and a room =====
@@ -399,7 +468,7 @@ const guestDone = (async () => {
       && forged.body.gid !== first.body.gid, `bad=${bad.status} gid kept=${again.body.gid === first.body.gid}`);
 
   const noToken = await new Promise((resolve) => {
-    const ws = new WebSocket(`${BASE}?room=${room}-guest&tank=medium&name=x&adhoc=1`);
+    const ws = new WebSocket(`${BASE}?room=${room}-guest&tank=medium&name=x&adhoc=1&ts=${TS}`);
     ws.onmessage = () => resolve(false);
     ws.onerror = ws.onclose = () => resolve(true);
     setTimeout(() => resolve(false), 3000);
@@ -599,6 +668,7 @@ setTimeout(async () => {
     ...setting,
     ...guestChecks,
     ...lobbyChecks,
+    ...lobbyLogic,
     ["拠点制圧：bot が自分で拠点を取る", botCapture.owned !== null, `owned=${botCapture.owned}`],
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],

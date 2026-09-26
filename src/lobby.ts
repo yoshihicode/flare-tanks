@@ -6,7 +6,24 @@ export const LOBBY = {
   capacity: 6, // humans per room (3 vs 3)
   idleSec: 60, // a created room nobody has joined is dropped after this
   staleSec: 15 * 60, // a room that hasn't reported for this long is assumed gone
+  createLimit: 5, // rooms one IP may create per createWindowSec (spec: limit creations per source)
+  createWindowSec: 10 * 60,
+  // Free plan: 100k DO requests/day, incoming WebSocket messages count 20 to a request -> ~2M messages.
+  // New rooms are refused once today's total passes stopRatio (resets 00:00 UTC = 09:00 JST)
+  dailyMessages: 2_000_000,
+  stopRatio: 0.8,
 };
+
+// UTC day key for the daily message counter
+export const dayKey = (nowMs: number) => new Date(nowMs).toISOString().slice(0, 10);
+
+// Rate limit check. Returns null when the limit is reached, otherwise the updated list of creation times
+export function rateLimited(times: number[], now: number): number[] | null {
+  const recent = times.filter((t) => now - t < LOBBY.createWindowSec);
+  return recent.length >= LOBBY.createLimit ? null : [...recent, now];
+}
+
+export const overBudget = (messages: number) => messages >= LOBBY.dailyMessages * LOBBY.stopRatio;
 
 export interface RoomEntry {
   id: string; // room Durable Object name (random, unguessable)

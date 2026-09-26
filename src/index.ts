@@ -8,6 +8,7 @@ import { Bot, type Pin } from "./bot.ts";
 import { DEFAULT_SETTINGS, parseSettings, settingsFromQuery, type RoomSettings } from "./settings.ts";
 import { GUEST, checkName, newGuestId, signToken, uniqueName, verifyToken } from "./guest.ts";
 import type { Env } from "./env.ts";
+import { verifyTurnstile } from "./turnstile.ts";
 export { Lobby } from "./lobby-do.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
@@ -32,6 +33,8 @@ const CONQUEST = {
   radius: 40, // capture zone radius (px, 2.5 tiles)
   respawnSec: 5, // respawn at own base after this delay
 };
+const USAGE_REPORT_SEC = 60; // how often a running room reports its incoming message count to the lobby
+
 // "Enemy spotted" pins shared within a team (humans with a key, Lv5 bots automatically)
 const PIN = {
   lifeSec: 6, // a pin disappears after this
@@ -145,11 +148,19 @@ const json = (body: unknown, status = 200) =>
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
-    // Refuse to run without a signing secret rather than fall back to a guessable default
-    if ((url.pathname === "/ws" || url.pathname.startsWith("/api/")) && !env.GUEST_SECRET) {
-      return new Response("サーバーの設定が未完了です（GUEST_SECRET）", { status: 500 });
+    // Refuse to run without secrets rather than fall back to guessable or disabled defaults
+    const needsSetup = url.pathname === "/ws" || url.pathname === "/lobby" || url.pathname.startsWith("/api/");
+    if (needsSetup && (!env.GUEST_SECRET || !env.TURNSTILE_SECRET || !env.TURNSTILE_SITEKEY)) {
+      return new Response("サーバーの設定が未完了です（GUEST_SECRET / TURNSTILE_SECRET / TURNSTILE_SITEKEY）", { status: 500 });
     }
     const secret = env.GUEST_SECRET!;
+    const debug = env.DEBUG_TOOLS === "1";
+    // Client IP for Turnstile and the per-IP creation limit. Dev tests may pose as another IP
+    const ip = (debug && req.headers.get("X-Test-IP")) || req.headers.get("CF-Connecting-IP");
+    const human = (token: unknown) => verifyTurnstile(env.TURNSTILE_SECRET!, token, ip);
+
+    // Public client config (the Turnstile site key is public by design)
+    if (url.pathname === "/api/config") return json({ turnstileSiteKey: env.TURNSTILE_SITEKEY });
 
     // Issue (or renew) a guest token: {name, token?} -> {token, gid, name}. A valid token keeps its guest ID
     if (url.pathname === "/api/guest" && req.method === "POST") {
@@ -177,10 +188,17 @@ export default {
       if (req.method !== "POST") return json({ error: "POSTで送ってください" }, 405);
       const m: any = await req.json().catch(() => null);
       if (!(await verifyToken(secret, m?.token))) return json({ error: "ゲストの確認に失敗しました" }, 401);
-      if (url.pathname === "/api/rooms") return toLobby("/create", { settings: m.settings });
-      if (url.pathname === "/api/quick") return toLobby("/quick", {});
+      // Creating (and quick join, which may create) needs a Turnstile pass; code lookup doesn't join by itself
+      if (url.pathname !== "/api/code" && !(await human(m?.ts))) return json({ error: "自動プログラム対策の確認に失敗しました。もう一度お試しください" }, 403);
+      if (url.pathname === "/api/rooms") return toLobby("/create", { settings: m.settings, ip: ip ?? "unknown" });
+      if (url.pathname === "/api/quick") return toLobby("/quick", { ip: ip ?? "unknown" });
       if (!/^\d{6}$/.test(String(m.code))) return json({ error: "招待コードは6桁の数字です" }, 400);
       return lobby.fetch(`https://lobby/code?code=${m.code}`);
+    }
+
+    // Dev only: set today's message counter to test the budget cutoff
+    if (url.pathname === "/api/debug/usage" && debug && req.method === "POST") {
+      return toLobby("/usage-set", await req.json().catch(() => ({})));
     }
 
     if (url.pathname === "/ws") {
@@ -190,6 +208,7 @@ export default {
       const gid = await verifyToken(secret, url.searchParams.get("token"));
       const checked = checkName(url.searchParams.get("name"));
       if (!gid || "error" in checked) return new Response("ゲストの確認に失敗しました", { status: 401 });
+      if (!(await human(url.searchParams.get("ts")))) return new Response("自動プログラム対策の確認に失敗しました", { status: 403 });
       const room = (url.searchParams.get("room") || "default").slice(0, 32);
       const stub = env.ROOM.get(env.ROOM.idFromName(room));
       // The room trusts these headers: rooms are reachable only through this Worker
@@ -218,6 +237,8 @@ export class Room extends DurableObject<Env> {
   setup: RoomSetup | null = null; // from the lobby: room id, invite code, settings (null for dev ad-hoc rooms)
   banned = new Set<string>(); // guest IDs kicked by the owner
   reportedPhase = "";
+  msgCount = 0; // incoming messages not yet reported to the lobby
+  usageAt = 0; // when usage was last reported (s)
   emptySince = 0; // when the last human left
   pins: Record<Team, Pin[]> = { A: [], B: [] };
   nextPinId = 1;
@@ -411,6 +432,16 @@ export class Room extends DurableObject<Env> {
     this.ctx.waitUntil(lobby.fetch("https://lobby/update", { method: "POST", body: JSON.stringify(body) }).catch(() => {}));
   }
 
+  // Send the incoming message count to the lobby's daily total (every minute while running, and on close)
+  reportUsage(now: number) {
+    if (!this.msgCount) return;
+    const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName("lobby"));
+    const body = JSON.stringify({ count: this.msgCount });
+    this.msgCount = 0;
+    this.usageAt = now;
+    this.ctx.waitUntil(lobby.fetch("https://lobby/usage", { method: "POST", body }).catch(() => {}));
+  }
+
   // Owner removes a player; they can't come back to this room
   kick(cid: unknown) {
     const target = typeof cid === "string" ? this.clients.get(cid) : undefined;
@@ -429,6 +460,7 @@ export class Room extends DurableObject<Env> {
   }
 
   onMessage(c: Client, data: unknown) {
+    this.msgCount++; // every incoming message counts toward the free-plan budget, valid or not
     if (typeof data !== "string" || data.length > 200) return;
     let m: any;
     try { m = JSON.parse(data); } catch { return; }
@@ -467,6 +499,7 @@ export class Room extends DurableObject<Env> {
     if (typeof m.freezeBots === "boolean") this.debug.freezeBots = m.freezeBots;
     if (m.expireReserve === true) this.reserved.clear(); // pretend the reconnect window has passed
     if (m.closeWhenEmpty === true) this.debug.closeWhenEmpty = true; // skip the reconnect window when the last human leaves
+    if (m.reportUsage === true) this.reportUsage(now); // send the message count now instead of within a minute
     if (Number.isFinite(m.phaseSec)) this.phaseEndsAt = now + m.phaseSec; // いまの段階の残り時間を変える
     if (m.killTeam === "A" || m.killTeam === "B") {
       for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; t.respawnAt = now + CONQUEST.respawnSec; }
@@ -623,6 +656,7 @@ export class Room extends DurableObject<Env> {
   // The room is over: tell the lobby and forget the setup, so old links show "not found"
   stopLoop() {
     this.report(true);
+    this.reportUsage(Date.now() / 1000);
     if (this.setup) this.ctx.waitUntil(this.ctx.storage.delete("setup"));
     this.setup = null;
     this.banned.clear();
@@ -659,6 +693,7 @@ export class Room extends DurableObject<Env> {
     if (this.clients.size === 0 && (this.debug.closeWhenEmpty || now - this.emptySince > GUEST.reserveSec)) return this.stopLoop();
     this.updatePhase(now);
     if (this.phase !== this.reportedPhase) this.report(); // phase changes show up in the lobby list
+    if (now - this.usageAt >= USAGE_REPORT_SEC) this.reportUsage(now);
     for (const team of TEAMS) this.pins[team] = this.pins[team].filter((p) => now - p.at < PIN.lifeSec);
     this.thinkBots(now);
 

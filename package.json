@@ -4,7 +4,7 @@
   "type": "module",
   "version": "0.1.0",
   "scripts": {
-    "dev": "wrangler dev --var DEBUG_TOOLS:1 --var GUEST_SECRET:dev-only-not-a-secret",
+    "dev": "wrangler dev --var DEBUG_TOOLS:1 --var GUEST_SECRET:dev-only-not-a-secret --var TURNSTILE_SITEKEY:1x00000000000000000000AA --var TURNSTILE_SECRET:1x0000000000000000000000000000000AA",
     "deploy": "wrangler deploy",
     "test:smoke": "node scripts/smoke-test.mjs"
   },

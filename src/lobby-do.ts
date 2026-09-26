@@ -4,7 +4,9 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env.ts";
 import { DEFAULT_SETTINGS, parseSettings } from "./settings.ts";
-import { LOBBY, expired, newCode, newRoomId, pickQuick, publicList, type RoomEntry } from "./lobby.ts";
+import {
+  LOBBY, dayKey, expired, newCode, newRoomId, overBudget, pickQuick, publicList, rateLimited, type RoomEntry,
+} from "./lobby.ts";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json; charset=utf-8" } });
@@ -20,10 +22,23 @@ export class Lobby extends DurableObject<Env> {
     }
     const body = req.method === "POST" ? await req.json().catch(() => ({})) as any : {};
     switch (url.pathname) {
-      case "/create": return json(await this.create(parseSettings(body.settings)));
+      case "/create": return this.guardedCreate(parseSettings(body.settings), body.ip);
       case "/quick": {
         const room = pickQuick(await this.rooms());
-        return json(room ? { id: room.id, code: room.code } : await this.create({ ...DEFAULT_SETTINGS, public: true }));
+        return room ? json({ id: room.id, code: room.code }) : this.guardedCreate({ ...DEFAULT_SETTINGS, public: true }, body.ip);
+      }
+      // Incoming message counts reported by rooms (daily total, UTC)
+      case "/usage": {
+        const key = `msgs:${dayKey(Date.now())}`;
+        const n = Number(body.count) || 0;
+        if (n > 0) await this.ctx.storage.put(key, ((await this.ctx.storage.get<number>(key)) ?? 0) + n);
+        return json({ ok: true });
+      }
+      // Dev only (the Worker checks DEBUG_TOOLS): read today's total, or set it to test the cutoff
+      case "/usage-set": {
+        const key = `msgs:${dayKey(Date.now())}`;
+        if (body.value !== undefined) await this.ctx.storage.put(key, Number(body.value) || 0);
+        return json({ value: (await this.ctx.storage.get<number>(key)) ?? 0 });
       }
       case "/code": {
         const code = url.searchParams.get("code") ?? "";
@@ -37,6 +52,19 @@ export class Lobby extends DurableObject<Env> {
 
   async rooms(): Promise<RoomEntry[]> {
     return [...(await this.ctx.storage.list<RoomEntry>({ prefix: "room:" })).values()];
+  }
+
+  // Room creation with the abuse limits: today's message budget and creations per IP
+  async guardedCreate(settings: typeof DEFAULT_SETTINGS, ip: unknown) {
+    const used = (await this.ctx.storage.get<number>(`msgs:${dayKey(Date.now())}`)) ?? 0;
+    if (overBudget(used)) {
+      return json({ error: "本日の利用上限に近いため、新しい部屋は作れません（日本時間9:00に再開します）" }, 503);
+    }
+    const key = `ip:${typeof ip === "string" ? ip : "unknown"}`;
+    const times = rateLimited((await this.ctx.storage.get<number[]>(key)) ?? [], Date.now() / 1000);
+    if (!times) return json({ error: "部屋を作りすぎです。しばらく待ってからもう一度お試しください" }, 429);
+    await this.ctx.storage.put(key, times);
+    return json(await this.create(settings));
   }
 
   // New room: register it, then hand the settings to the room's own Durable Object
@@ -76,8 +104,15 @@ export class Lobby extends DurableObject<Env> {
   // Periodic cleanup of rooms nobody joined or that stopped reporting
   async alarm() {
     const rooms = await this.rooms();
-    const gone = expired(rooms, Date.now() / 1000);
+    const now = Date.now() / 1000;
+    const gone = expired(rooms, now);
     for (const r of gone) await this.ctx.storage.delete(`room:${r.id}`);
+    // Drop per-IP creation logs past the window, and message counters of previous days
+    for (const [key, times] of await this.ctx.storage.list<number[]>({ prefix: "ip:" })) {
+      if (times.every((t) => now - t >= LOBBY.createWindowSec)) await this.ctx.storage.delete(key);
+    }
+    const today = `msgs:${dayKey(Date.now())}`;
+    for (const key of (await this.ctx.storage.list({ prefix: "msgs:" })).keys()) if (key !== today) await this.ctx.storage.delete(key);
     if (gone.length) this.broadcast(await this.rooms());
     if (rooms.length > gone.length) await this.ctx.storage.setAlarm(Date.now() + LOBBY.idleSec * 1000);
   }

@@ -1,4 +1,4 @@
-# FLARE TANKS（ステップ4：拠点制圧モード・視界の補助）
+# FLARE TANKS（ステップ5：ロビー・ゲスト・乱用対策）
 
 Cloudflare Workers ＋ Durable Objects で動くトップビュー2D戦車対戦ゲームの最小構成です。
 
@@ -10,6 +10,7 @@ Cloudflare Workers ＋ Durable Objects で動くトップビュー2D戦車対戦
 - 拠点制圧モード（`?mode=conquest`）：3拠点、拠点1か所につき毎秒1pt、先に500pt（制限8分）。自陣で5秒後に復活
 - Q キーでピン（敵発見を味方に知らせる）。レベル5の bot もピンで連携する
 - 見えない敵の発砲は、方向と大まかな距離だけ音と画面端の印で伝わる。被弾方向の表示、見えなくなった敵の残像
+- 部屋の作成・参加時に Turnstile（自動プログラム対策）。同じ接続元からの部屋作成は10分に5回まで。1日の受信メッセージ数が無料枠の80%を超えたら新しい部屋を作れなくする
 - 名前を入力して遊ぶゲスト方式。サーバーが署名したトークンをブラウザに保存し、切断から30秒以内なら同じ戦車に戻れる
 - WASD／矢印キーで移動、マウスで照準、クリック／スペースで射撃
 - 壁との衝突、被弾・撃破（サーバー側で判定）
@@ -34,10 +35,12 @@ npm run dev          # http://localhost:8787 をブラウザのタブ2つで開�
 ## デプロイ
 ```bash
 npx wrangler login
-npx wrangler secret put GUEST_SECRET   # 初回のみ。ゲストトークンの署名鍵（長いランダムな文字列）
+npx wrangler secret put GUEST_SECRET        # 初回のみ。ゲストトークンの署名鍵（長いランダムな文字列）
+npx wrangler secret put TURNSTILE_SITEKEY   # 初回のみ。Cloudflare ダッシュボードで作った Turnstile のサイトキー
+npx wrangler secret put TURNSTILE_SECRET    # 初回のみ。同じウィジェットのシークレットキー
 npm run deploy
 ```
-`GUEST_SECRET` を設定しないと、本番ではゲストの確認ができないため接続を受け付けません。
+この3つを設定しないと、本番では接続を受け付けません（安全でない既定値で動かさないため）。Turnstile のウィジェットには、デプロイ先のホスト名（例：`flare-tanks.<アカウント>.workers.dev`）を登録してください。
 無料プランでは SQLite バックエンドの Durable Object が必要なため、`wrangler.jsonc` の migrations は `new_sqlite_classes` にしています。
 
 ## ファイル構成
@@ -54,5 +57,4 @@ npm run deploy
 | `wrangler.jsonc` | Cloudflare の設定 |
 
 ## 現時点の割り切り（次以降で対応）
-- Turnstile（自動プログラム対策）と部屋作成数の制限 → ステップ5の残り
 - スマホ操作なし → ステップ6

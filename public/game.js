@@ -116,6 +116,33 @@ async function signIn() {
   store.set("ft.name", guest.name);
 }
 
+// ===== Turnstile (bot check before creating or joining a room). Tokens are single-use =====
+let turnstileKey = null;
+let turnstileWidget = null;
+function loadTurnstile() {
+  if (window.turnstile) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("自動プログラム対策を読み込めませんでした。通信環境を確認してください"));
+    document.head.append(s);
+  });
+}
+// A fresh token; the widget only shows itself if Cloudflare wants the player to interact
+async function humanToken() {
+  turnstileKey ??= (await (await fetch("/api/config")).json()).turnstileSiteKey;
+  await loadTurnstile();
+  return new Promise((resolve, reject) => {
+    if (turnstileWidget !== null) window.turnstile.remove(turnstileWidget);
+    // The container must not have id="turnstile": that id would shadow window.turnstile
+    turnstileWidget = window.turnstile.render("#humanCheck", {
+      sitekey: turnstileKey, appearance: "interaction-only", callback: resolve,
+      "error-callback": () => reject(new Error("自動プログラム対策の確認に失敗しました。もう一度お試しください")),
+    });
+  });
+}
+
 // Room actions go through the Worker with our token. Returns the JSON body or throws with its error text
 async function api(path, body = {}) {
   const res = await fetch(path, {
@@ -173,7 +200,7 @@ async function goLobby() {
   }
   // Links straight into a room: ?code=123456 (invite) or ?room=name (dev-only ad-hoc room)
   const params = new URLSearchParams(location.search);
-  if (params.has("room")) return enterRoom(params.get("room"), true);
+  if (params.has("room")) return withLobbyError(enterRoom)(params.get("room"), true);
   if (params.has("code")) {
     const code = params.get("code");
     window.history.replaceState(null, "", location.pathname); // don't auto-join again after leaving (a local "history" shadows it)
@@ -214,7 +241,7 @@ function renderRooms(rooms) {
     btn.type = "button";
     btn.textContent = r.humans >= r.capacity ? "満員" : "参加";
     btn.disabled = r.humans >= r.capacity;
-    btn.addEventListener("click", () => enterRoom(r.id));
+    btn.addEventListener("click", withLobbyError(() => enterRoom(r.id)));
     li.append(info, btn);
     roomList.append(li);
   }
@@ -226,9 +253,12 @@ const withLobbyError = (fn) => async (...args) => {
 const joinByCode = withLobbyError(async (code) => {
   if (!/^\d{6}$/.test(code)) throw new Error("招待コードは6桁の数字です");
   const { id } = await api("/api/code", { code });
-  enterRoom(id);
+  await enterRoom(id);
 });
-document.getElementById("quick").addEventListener("click", withLobbyError(async () => enterRoom((await api("/api/quick")).id)));
+document.getElementById("quick").addEventListener("click", withLobbyError(async () => {
+  lobbyMsg.textContent = "部屋を探しています…";
+  await enterRoom((await api("/api/quick", { ts: await humanToken() })).id);
+}));
 document.getElementById("create").addEventListener("click", () => { createForm.hidden = false; });
 document.getElementById("cancelCreate").addEventListener("click", () => { createForm.hidden = true; });
 document.getElementById("back").addEventListener("click", () => showScreen("title"));
@@ -243,16 +273,18 @@ createForm.addEventListener("submit", withLobbyError(async (e) => {
     mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value),
     ff: f.ff.checked, public: f.public.checked,
   };
-  const { id } = await api("/api/rooms", { settings });
+  const { id } = await api("/api/rooms", { settings, ts: await humanToken() });
   createForm.hidden = true;
-  enterRoom(id);
+  await enterRoom(id);
 }));
-rejoinBtn.addEventListener("click", () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc));
+rejoinBtn.addEventListener("click", withLobbyError(async () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc)));
 
-function enterRoom(id, adhoc = false) {
+// Joining needs its own Turnstile token too (spec: check on create and join)
+async function enterRoom(id, adhoc = false) {
+  const ts = await humanToken();
   lastRoom = { id, adhoc };
   showScreen("game");
-  connect(id, adhoc);
+  connect(id, adhoc, ts);
 }
 
 // Esc leaves the room and goes back to the lobby right away (without waiting for the close handshake)
@@ -264,10 +296,10 @@ addEventListener("keydown", (e) => {
   roomClosed(1000, true);
 });
 
-function connect(roomId, adhoc) {
+function connect(roomId, adhoc, ts) {
   const params = new URLSearchParams(location.search);
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const q = new URLSearchParams({ room: roomId, tank: tankType, token: guest.token, name: guest.name });
+  const q = new URLSearchParams({ room: roomId, tank: tankType, token: guest.token, name: guest.name, ts });
   // Dev-only ad-hoc rooms take their settings from the page URL (?mode=, ?bot=, ...)
   if (adhoc) {
     q.set("adhoc", "1");
