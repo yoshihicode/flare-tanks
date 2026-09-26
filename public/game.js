@@ -1031,6 +1031,11 @@ function frame() {
   hud.clearRect(0, 0, W, H);
   if (!curr || !map.length) {
     requestAnimationFrame(frame);
+
+// PWA: the service worker lets the game be installed to the home screen (see sw.js)
+if ("serviceWorker" in navigator) {
+  addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* still playable without it */ }));
+}
     return;
   }
   const nowMs = performance.now();
@@ -1070,8 +1075,18 @@ function frame() {
   syncSettingsPanel();
   syncTouchBar();
   requestAnimationFrame(frame);
+
+// PWA: the service worker lets the game be installed to the home screen (see sw.js)
+if ("serviceWorker" in navigator) {
+  addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* still playable without it */ }));
+}
 }
 requestAnimationFrame(frame);
+
+// PWA: the service worker lets the game be installed to the home screen (see sw.js)
+if ("serviceWorker" in navigator) {
+  addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* still playable without it */ }));
+}
 
 // ===== 効果音（Web Audio APIで合成） =====
 const SOUND = {

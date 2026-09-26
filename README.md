@@ -52,6 +52,7 @@ npm run deploy
 | `src/lobby-do.ts`・`src/lobby.ts` | ロビー（部屋一覧・作成・クイック参加・招待コード） |
 | `src/guest.ts`・`src/settings.ts` | ゲスト識別（署名トークン・名前）、部屋の設定 |
 | `src/bot.ts` | bot の思考（経路探索・状態遷移・強さ5段階） |
+| `public/manifest.json`・`public/sw.js` | PWA（ホーム画面に追加）。アイコンは `node scripts/make-icons.mjs` で生成 |
 | `public/ghosts.js` | 見えなくなった敵の残像（クライアントのみ） |
 | `public/shared.js` | サーバーと共有する判定（移動・視界・可視ポリゴン）と戦車3種の性能 |
 | `wrangler.jsonc` | Cloudflare の設定 |

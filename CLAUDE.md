@@ -20,6 +20,7 @@ Cloudflare Workers 無料プランだけで動く、ブラウザ向けトップ�
 - `src/lobby-do.ts`：ロビー用DO（部屋一覧・作成・クイック参加・招待コード。WebSocket Hibernation）。判断のロジックは `src/lobby.ts`（Node から直接テストできる）。`src/env.ts`：バインディングの型
 - `src/bot.ts`：bot の思考（A*・状態遷移・強さ5段階）。Room に依存せず、Node から直接テストできる
 - `public/`：静的配信。`index.html`（タイトル画面）、`game.js`（描画・入力・通信・効果音）、`ghosts.js`（見えなくなった敵の残像。クライアントのみ）、`touch.js`（ツインスティック）、`interp.js`（補間バッファ）、`minimap.js`（ミニマップ）。どれも Node から直接テストできる
+- `public/manifest.json`・`public/sw.js`・`public/icons/`：PWA。アイコンは `node scripts/make-icons.mjs` で生成する（依存なし、生成物はコミットする）。`sw.js` の保存対象（SHELL）は、クライアントのファイルを増やしたら追加する
 - `public/shared.js`：サーバーとクライアントで共有する判定（壁・移動・砲塔旋回・見通し線・視界・可視ポリゴン）と戦車3種の性能（`TANK_TYPES`）。サーバーは `import` してバンドルする
 - ビルドツールなし。クライアントは素のJavaScript、サーバーはTypeScript（wranglerがバンドル）
 

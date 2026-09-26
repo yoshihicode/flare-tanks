@@ -10,6 +10,8 @@ import { updateGhosts, GHOST } from "../public/ghosts.js";
 import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "../public/touch.js";
 import { sample, pushSnapshot, INTERP } from "../public/interp.js";
 import { minimapLayout, minimapDots, MINIMAP } from "../public/minimap.js";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
 import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
 import { LOBBY, pickQuick, expired, newCode, rateLimited, overBudget, publicList } from "../src/lobby.ts";
 import { DEFAULT_SETTINGS } from "../src/settings.ts";
@@ -608,6 +610,38 @@ const clientChecks = (() => {
   ];
 })();
 
+// ===== PWA: manifest, icons and service worker as served by the dev server =====
+const pwaChecks = [];
+const pwaDone = (async () => {
+  const get = (path) => fetch(`${HTTP}${path}`);
+  const manifest = await (await get("/manifest.json")).json();
+  const pngSize = (buf) => [buf.readUInt32BE(16), buf.readUInt32BE(20)]; // IHDR width/height
+  const icons = await Promise.all(manifest.icons.map(async (i) => {
+    const buf = Buffer.from(await (await get(i.src)).arrayBuffer());
+    const sig = buf.subarray(1, 4).toString() === "PNG";
+    return sig && pngSize(buf).join("x") === i.sizes;
+  }));
+  pwaChecks.push(["PWA：マニフェスト（全画面・横向き）とアイコン（PNGの大きさが宣言どおり）",
+    manifest.display === "fullscreen" && manifest.orientation === "landscape" && manifest.start_url === "/"
+      && icons.length >= 2 && icons.every(Boolean) && manifest.icons.some((i) => i.purpose === "maskable"), JSON.stringify(icons)]);
+  const html = await (await get("/")).text();
+  pwaChecks.push(["PWA：ページがマニフェスト・iOS 用アイコンを参照する",
+    html.includes('rel="manifest"') && html.includes('rel="apple-touch-icon"') && (await get("/icons/apple-touch-icon.png")).ok, ""]);
+  // The service worker source, run in a sandbox to call its request filter
+  const src = readFileSync(new URL("../public/sw.js", import.meta.url), "utf8");
+  const sandbox = { self: { addEventListener() {}, location: { origin: HTTP } }, caches: {}, fetch() {}, URL };
+  vm.runInNewContext(src, sandbox);
+  const handles = (path, origin = HTTP) => sandbox.shouldHandle(new URL(path, origin), HTTP);
+  pwaChecks.push(["PWA：Service Worker は画面のファイルだけ扱い、API・WebSocket・外部には触れない",
+    handles("/game.js") && handles("/") && !handles("/api/guest") && !handles("/ws") && !handles("/lobby")
+      && !handles("/turnstile/v0/api.js", "https://challenges.cloudflare.com"), ""]);
+  const shell = [...src.matchAll(/"(\/[^"]*)"/g)].map((m) => m[1]).filter((p) => !p.startsWith("/api") && p !== "/ws" && p !== "/lobby");
+  const missing = [];
+  for (const path of shell) if (!(await get(path)).ok) missing.push(path);
+  pwaChecks.push(["PWA：保存対象のファイルがすべて取得できる（1つでも欠けるとインストールに失敗する）",
+    shell.length >= 8 && missing.length === 0, `files=${shell.length} missing=${missing.join(",")}`]);
+})();
+
 // 確認項目の集計
 const events = new Set();
 let snaps = 0;
@@ -721,6 +755,7 @@ b.onSnap = (m) => {
   await settingsDone;
   await guestDone;
   await lobbyDone;
+  await pwaDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}（${(snaps / elapsed).toFixed(1)}回/秒、${elapsed.toFixed(0)}秒）`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)),
@@ -757,6 +792,7 @@ b.onSnap = (m) => {
     ...ghostChecks,
     ...touchChecks,
     ...clientChecks,
+    ...pwaChecks,
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);
