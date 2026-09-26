@@ -197,6 +197,15 @@ const conquestDone = (async () => {
   cstep("時間切れはポイントが多い側の勝ち", await until(() => g().ph === "matchEnd" && g().mr === "B"), `sc=${g().sc} mr=${g().mr}`);
 })();
 
+// ===== Another room: bots capture points on their own in conquest mode =====
+const botCapture = { owned: null };
+const botCaptureDone = (async () => {
+  const x = await join("medium", room + "-botcap", "&mode=conquest&bot=3"); // idle human; the other 5 are bots
+  await startNow(x);
+  const got = await until(() => x.last.g.pts.some((p) => p.o), 15000);
+  botCapture.owned = got ? x.last.g.pts.filter((p) => p.o).map((p) => `${p.id}:${p.o}`).join(",") : null;
+})();
+
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
 function inPolygon(pts, x, y) {
   let inside = false;
@@ -291,6 +300,7 @@ b.onSnap = (m) => {
 setTimeout(async () => {
   await flowDone;
   await conquestDone;
+  await botCaptureDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
@@ -300,6 +310,7 @@ setTimeout(async () => {
     ...botChecks(),
     ...flow,
     ...conquest,
+    ["拠点制圧：bot が自分で拠点を取る", botCapture.owned !== null, `owned=${botCapture.owned}`],
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
     ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,

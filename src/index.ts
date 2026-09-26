@@ -430,12 +430,14 @@ export class Room extends DurableObject<Env> {
 
   // bot の入力を決める。渡すのは味方の状態と「その bot の視界に入っている敵」だけ
   thinkBots(now: number) {
+    // Capture point states are public, so every bot may use them (conquest mode only)
+    const objectives = this.points.map((p) => ({ id: p.id, x: p.x, y: p.y, r: CONQUEST.radius, owner: p.owner, contested: p.contested }));
     for (const t of this.tanks) {
       if (!t.bot || t.dead) continue;
       if (this.debug.freezeBots) { t.input = { ...IDLE, aim: t.aim }; continue; }
       const enemies = this.tanks.filter((e) => e.team !== t.team && !e.dead && canSeeTank(GRID, t, e));
       const allies = this.tanks.filter((a) => a.team === t.team && a !== t);
-      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now });
+      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now, objectives });
     }
   }
 

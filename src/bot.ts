@@ -15,7 +15,9 @@ export interface Perception {
   enemies: TankView[]; // 自分の視界に入っている敵だけ
   hit: { dir: number; at: number } | null; // 最後に撃たれた方向（弾が飛んできた向き）と時刻
   now: number; // 秒
+  objectives?: Objective[]; // conquest mode only: capture point states (public info, no enemy positions)
 }
+export interface Objective { id: string; x: number; y: number; r: number; owner: string | null; contested: boolean }
 // 同じチームの bot で共有する発見情報（レベル5だけが読み書きする）
 export interface TeamIntel { x: number; y: number; at: number }
 export interface BotOptions {
@@ -55,6 +57,12 @@ const BOT = {
   ambushSec: [3, 6], // 待ち伏せする時間の範囲
   flankTiles: 4, // 回り込むときに横へずらすタイル数
   repathSec: 1, // 追跡中に経路を引き直す間隔
+  // Conquest: how a bot picks which capture point to go to (lower score = better; base score is distance in px)
+  objectiveSec: 2, // re-pick the target point at this interval
+  ownedPenalty: 400, // our own uncontested point: only defended when nothing else needs us
+  contestedBonus: 250, // a contested point (or one being taken from us) pulls allies in
+  allyPenalty: 250, // per ally already in the zone, so bots spread over points
+  holdRatio: 0.6, // stop moving once within this fraction of the zone radius
 };
 
 // ===== 経路探索（タイル上のA*、上下左右の4方向） =====
@@ -94,8 +102,9 @@ export function findPath(g: Grid, from: Tile, to: Tile): Tile[] | null {
 export const toTile = (x: number, y: number): Tile => [Math.floor(x / TILE), Math.floor(y / TILE)];
 const center = (t: Tile) => ({ x: t[0] * TILE + TILE / 2, y: t[1] * TILE + TILE / 2 });
 const sameTile = (a: Tile, b: Tile) => a[0] === b[0] && a[1] === b[1];
+const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
 
-type State = "patrol" | "ambush" | "engage" | "chase" | "retreat";
+type State = "patrol" | "ambush" | "engage" | "chase" | "retreat" | "objective";
 interface Memory { id: string; x: number; y: number; vx: number; vy: number; seenAt: number }
 
 // ===== bot 本体 =====
@@ -118,6 +127,8 @@ export class Bot {
   strafeAt = 0;
   ambushUntil = 0;
   flank: { src: object; x: number; y: number } | null = null; // 回り込み先（発見情報ごとに一度だけ決める）
+  objective: string | null = null; // id of the capture point this bot is heading to / holding
+  objectiveAt = -Infinity;
 
   constructor(level: number, grid: Grid, opts: BotOptions, rand: () => number = Math.random) {
     this.level = (level in BOT_LEVELS ? level : 3) as BotLevel;
@@ -134,9 +145,11 @@ export class Bot {
     const hpRate = s.hp / tankSpec(s.type).hp;
     const threatened = target || (p.hit && p.now - p.hit.at < BOT.hitMemorySec);
 
-    // 状態を決める：退避 → 交戦 → 追跡 → 待ち伏せ → 巡回 の順に優先
+    // 状態を決める：退避 → 交戦 → 拠点（拠点制圧モード）→ 追跡 → 待ち伏せ → 巡回 の順に優先
+    const point = this.pickObjective(p);
     if (this.cfg.retreatHp > 0 && hpRate <= this.cfg.retreatHp && threatened) this.state = "retreat";
     else if (target) this.state = "engage";
+    else if (point) this.state = "objective";
     else if (this.chaseGoal(p)) this.state = "chase";
     else if (this.state === "ambush" && p.now < this.ambushUntil) this.state = "ambush";
     else if (this.state !== "patrol") { this.state = "patrol"; this.path = []; }
@@ -167,9 +180,22 @@ export class Bot {
         if (!target && !(p.hit && p.now - p.hit.at < BOT.hitMemorySec)) aim = Math.atan2(g.y - s.y, g.x - s.x);
         break;
       }
+      case "objective": {
+        // Go into the zone, then hold there watching toward the enemy base
+        const o = point!;
+        const inside = Math.hypot(o.x - s.x, o.y - s.y) < o.r * BOT.holdRatio;
+        move = inside ? { mx: 0, my: 0 } : this.goTo(s, o, p.now);
+        if (!(p.hit && p.now - p.hit.at < BOT.hitMemorySec)) {
+          const toward = inside
+            ? Math.atan2(this.opts.enemyHome.y - s.y, this.opts.enemyHome.x - s.x)
+            : move.mx || move.my ? Math.atan2(move.my, move.mx) : s.aim;
+          aim = toward + Math.sin(p.now * BOT.lookSpeed + s.x * 0.01) * BOT.lookSweep * (inside ? 0.8 : 0.5);
+        }
+        break;
+      }
       case "ambush":
-        // その場で敵陣の方向を見張る（少しだけ首を振る）
-        if (!target) {
+        // その場で敵陣の方向を見張る（少しだけ首を振る）。Being hit overrides this, as in the other states
+        if (!target && !(p.hit && p.now - p.hit.at < BOT.hitMemorySec)) {
           const toward = Math.atan2(this.opts.enemyHome.y - s.y, this.opts.enemyHome.x - s.x);
           aim = toward + Math.sin(p.now * BOT.lookSpeed) * BOT.lookSweep * 0.5;
         }
@@ -196,6 +222,32 @@ export class Bot {
       }
     }
     return { ...move, aim, fire };
+  }
+
+  // Conquest: choose the capture point to go to. Re-picked every few seconds so bots don't flip-flop.
+  // Uses only public point states and ally positions, never hidden enemy positions
+  pickObjective(p: Perception): Objective | null {
+    const list = p.objectives;
+    if (!list || !list.length) return null;
+    const s = p.self;
+    const current = list.find((o) => o.id === this.objective);
+    if (current && p.now - this.objectiveAt < BOT.objectiveSec) return current;
+    const score = (o: Objective) => {
+      let v = Math.hypot(o.x - s.x, o.y - s.y);
+      if (o.contested) v -= BOT.contestedBonus;
+      else if (o.owner === s.team) v += BOT.ownedPenalty;
+      const alliesIn = p.allies.filter((a) => !a.dead && Math.hypot(a.x - o.x, a.y - o.y) <= o.r).length;
+      v += alliesIn * BOT.allyPenalty;
+      return v;
+    };
+    // When every point is ours and quiet, defend the one closest to the enemy base
+    const allOurs = list.every((o) => o.owner === s.team && !o.contested);
+    const best = allOurs
+      ? list.reduce((a, b) => (dist2(b, this.opts.enemyHome) < dist2(a, this.opts.enemyHome) ? b : a))
+      : list.reduce((a, b) => (score(b) < score(a) ? b : a));
+    this.objective = best.id;
+    this.objectiveAt = p.now;
+    return best;
   }
 
   // 視界に入った敵から狙う相手を選び、記憶と共有情報を更新する

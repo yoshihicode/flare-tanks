@@ -17,11 +17,11 @@ function tank(id, team, pos, extra = {}) {
 }
 
 // サーバーと同じ手順で bot を動かす。see(now) は、その時点で bot の視界に入っている敵
-function run(bot, self, { sec, see = () => [], hit = null, onTick = () => {} }) {
+function run(bot, self, { sec, see = () => [], hit = null, onTick = () => {}, allies = [], objectives }) {
   let firstFire = null;
   for (let i = 0; i < sec / DT; i++) {
     const now = i * DT;
-    const input = bot.think({ self, allies: [], enemies: see(now), hit, now });
+    const input = bot.think({ self, allies, enemies: see(now), hit, now, objectives });
     stepTank(grid, self, input.mx, input.my, DT);
     self.aim = turnTurret(self.type, self.aim, input.aim, DT);
     if (input.fire && firstFire === null) firstFire = now;
@@ -109,6 +109,42 @@ export function botChecks() {
     run(makeBot(3), self, { sec: 1.5, hit: { dir: Math.PI / 2, at: 0 } });
     const off = Math.abs(angleDiff(self.aim, Math.PI / 2));
     checks.push(["bot は撃たれた方向を向く", off < 0.1, `ずれ=${off.toFixed(2)}rad`]);
+  }
+  // ===== Conquest: capture point behavior =====
+  const zone = (id, tx, ty, owner = null, contested = false) => ({ id, ...at(tx, ty), r: 40, owner, contested });
+  const inZone = (t, o) => dist(t, o) <= o.r;
+
+  // Heads for a point that isn't ours (skips the nearer point we already own), then stays in the zone
+  {
+    const objectives = [zone("A", 8, 10, "A"), zone("C", 20, 10)];
+    const self = tank("b", "A", at(4, 10));
+    let insideTicks = 0;
+    run(makeBot(3), self, { sec: 8, objectives, onTick: () => { if (inZone(self, objectives[1])) insideTicks++; } });
+    checks.push(["拠点制圧：自チームのものでない拠点へ向かい、範囲内にとどまる",
+      inZone(self, objectives[1]) && insideTicks > 40, `inside=${(insideTicks * DT).toFixed(1)}s`]);
+  }
+  // A contested point pulls the bot in, even if it's farther than a neutral one
+  {
+    const objectives = [zone("A", 9, 10), zone("B", 20, 16, "A", true)];
+    const self = tank("b", "A", at(4, 10));
+    run(makeBot(3), self, { sec: 8, objectives });
+    checks.push(["拠点制圧：競合中の拠点へ加勢する", inZone(self, objectives[1]), `pos=(${self.x | 0},${self.y | 0})`]);
+  }
+  // With an ally already holding the nearest neutral point, the bot takes the other one
+  {
+    const objectives = [zone("A", 9, 10), zone("C", 20, 10)];
+    const ally = tank("x", "A", at(9, 10));
+    const self = tank("b", "A", at(4, 10));
+    run(makeBot(3), self, { sec: 8, objectives, allies: [ally] });
+    checks.push(["拠点制圧：味方がいる拠点は避けて分散する", inZone(self, objectives[1]), `pos=(${self.x | 0},${self.y | 0})`]);
+  }
+  // Seeing an enemy still takes priority over walking to a point
+  {
+    const objectives = [zone("C", 20, 10)];
+    const self = tank("b", "A", at(10, 10));
+    const enemy = tank("e", "B", at(10, 15));
+    const { firstFire } = run(makeBot(3), self, { sec: 3, objectives, see: () => [enemy] });
+    checks.push(["拠点制圧：敵が見えたら拠点より交戦を優先", firstFire !== null, `firstFire=${firstFire?.toFixed(2)}s`]);
   }
   return checks;
 }
