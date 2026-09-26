@@ -20,7 +20,7 @@ function join(tank, roomName = room, extra = "") {
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.t === "init") grid ??= makeGrid(m.map);
+      if (m.t === "init") { grid ??= makeGrid(m.map); c.init = m; }
       else if (m.t === "s") {
         c.id = m.me; // 観戦中は null
         c.last = m;
@@ -134,6 +134,69 @@ const flowDone = (async () => {
   step("部屋主にだけ owner が付く", p.last.g.owner === true && q.last.g.owner === false && r.last.g.owner === false);
 })();
 
+// ===== Another room: conquest mode flow (bots frozen; situations set up with debug commands) =====
+const conquest = [];
+const cstep = (name, ok, detail = "") => conquest.push([name, ok, detail]);
+const conquestDone = (async () => {
+  const room4 = room + "-conquest";
+  const p = await join("medium", room4, "&mode=conquest"); // A, owner; the first player picks the mode
+  const q = await join("medium", room4); // B
+  debug(p, { freezeBots: true });
+  const qEvents = [];
+  q.onSnap = (m) => qEvents.push(...m.ev);
+  const g = () => p.last.g;
+  const pt = (id) => g().pts.find((x) => x.id === id);
+  const P = Object.fromEntries(p.init.points.map((x) => [x.id, x]));
+  const W = grid.w * TILE, H = grid.h * TILE;
+  const near = (v, w) => Math.abs(v - w) < 0.5;
+  cstep("拠点は3か所（Cは中央、A・Bは点対称）",
+    p.init.points.length === 3 && near(P.A.x + P.B.x, W) && near(P.A.y + P.B.y, H) && near(P.C.x, W / 2) && near(P.C.y, H / 2)
+      && ["A", "B", "C"].every((id) => !isWall(grid, P[id].x, P[id].y)),
+    p.init.points.map((x) => `${x.id}(${x.x},${x.y})`).join(" "));
+
+  await startNow(p);
+  debug(p, { moveX: P.A.x, moveY: P.A.y });
+  await sleep(1000);
+  const p1 = pt("A").p;
+  cstep("自チームだけが範囲内なら制圧が進む", p1 > 0.1 && p1 < 0.4 && pt("A").o === null, `progress=${p1}`);
+  debug(q, { moveX: P.A.x + 8, moveY: P.A.y });
+  await sleep(300);
+  const c0 = pt("A").p;
+  await sleep(500);
+  cstep("敵味方が両方いると競合中で止まる", pt("A").c && pt("A").p === c0, `contested=${pt("A").c} ${c0}→${pt("A").p}`);
+  debug(q, { moveX: P.B.x, moveY: P.B.y });
+  const owned = await until(() => pt("A").o === "A", 6000);
+  cstep("制圧が完了すると拠点を持つ", owned, `owner=${pt("A").o}`);
+  // q's snapshot for the same tick may arrive a little after p's, so wait for it
+  const notified = await until(() => qEvents.some((e) => e.e === "cap" && e.team === "A"), 1000);
+  cstep("制圧は相手チームにも通知される", notified, `cap events=${qEvents.filter((e) => e.e === "cap").length}`);
+  const s0 = g().sc[0];
+  await sleep(2000);
+  const gain = g().sc[0] - s0;
+  cstep("拠点1か所につき毎秒1pt", gain >= 1 && gain <= 3, `+${gain}pt / 2s`);
+
+  debug(p, { killTeam: "B" });
+  await until(() => q.last.tanks.find((k) => k.id === q.id)?.dead);
+  const deadAt = Date.now();
+  const back = await until(() => !q.last.tanks.find((k) => k.id === q.id).dead, 7000);
+  const sec = (Date.now() - deadAt) / 1000;
+  const qTank = q.last.tanks.find((k) => k.id === q.id);
+  cstep("撃破から5秒後に自陣で復活", back && sec > 4 && sec < 6.5 && qTank.x > W / 2, `${sec.toFixed(1)}s x=${qTank.x}`);
+
+  const r = await join("light", room4); // joins mid-match
+  cstep("途中参加は即参加（bot と交代）", r.id !== null && g().ph === "play", `me=${r.id}`);
+
+  debug(p, { score: { A: 499.5 } });
+  cstep("先に500ptに届いたチームの勝ち", await until(() => g().ph === "matchEnd" && g().mr === "A"), `sc=${g().sc} mr=${g().mr}`);
+  debug(p, { phaseSec: 0 });
+  await until(() => g().ph === "wait");
+  cstep("次の試合では拠点とポイントがリセット", g().sc[0] === 0 && g().pts.every((x) => x.o === null && x.p === 0), `sc=${g().sc}`);
+  await startNow(p);
+  debug(p, { score: { A: 3, B: 10 } });
+  debug(p, { phaseSec: 0 });
+  cstep("時間切れはポイントが多い側の勝ち", await until(() => g().ph === "matchEnd" && g().mr === "B"), `sc=${g().sc} mr=${g().mr}`);
+})();
+
 // 描画用の可視ポリゴンが、サーバーの見通し線判定と一致するか（通信なしで計算だけ確認する）
 function inPolygon(pts, x, y) {
   let inside = false;
@@ -227,6 +290,7 @@ b.onSnap = (m) => {
 
 setTimeout(async () => {
   await flowDone;
+  await conquestDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
@@ -235,6 +299,7 @@ setTimeout(async () => {
     ["bot が敵を見つけて撃つ（Lv5の部屋）", bots.fires > 0, `fire=${bots.fires}`],
     ...botChecks(),
     ...flow,
+    ...conquest,
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
     ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,

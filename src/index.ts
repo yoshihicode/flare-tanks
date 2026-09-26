@@ -20,6 +20,17 @@ const MATCH = {
   winRounds: 2, // 2ラウンド先取
   maxRounds: 3,
 };
+// Conquest mode (spec "ゲームモード" / "拠点制圧のルール")
+const CONQUEST = {
+  roundSec: 480, // time limit (8 min); higher score wins on timeout
+  target: 500, // first team to reach this score wins
+  scorePerSec: 1, // points per second for each owned capture point
+  captureSec: 5, // seconds for one team alone in the zone to go neutral -> owned (owned by enemy -> neutral takes the same)
+  radius: 40, // capture zone radius (px, 2.5 tiles)
+  respawnSec: 5, // respawn at own base after this delay
+};
+type Mode = "elim" | "conquest";
+const MODE_DEFAULT: Mode = "elim";
 type Phase = "wait" | "countdown" | "play" | "roundEnd" | "matchEnd";
 type Result = Team | "draw";
 const BOT_LEVEL_DEFAULT = 3; // bot の強さ（1〜5）。部屋を作った人の指定がなければこれ
@@ -38,6 +49,7 @@ interface Tank {
   id: string; team: Team; slot: number; type: TankType;
   x: number; y: number; body: number; aim: number;
   hp: number; dead: boolean; cooldown: number;
+  respawnAt: number; // conquest only: time (s) to respawn after being destroyed
   input: Input;
   human: string | null; // 操作している接続のID
   bot: Bot | null;
@@ -51,7 +63,10 @@ interface Client {
 }
 interface Bullet { x: number; y: number; vx: number; vy: number; life: number; team: Team; damage: number }
 // team：その出来事に関わる戦車のチーム（発射した側・被弾した側・弾の持ち主）。同じチームには常に送る
-interface GameEvent { e: "fire" | "hit" | "kill" | "wall"; x: number; y: number; team: Team }
+// pub: public event sent to everyone regardless of vision (e.g. a capture point changing owner)
+interface GameEvent { e: "fire" | "hit" | "kill" | "wall" | "cap"; x: number; y: number; team: Team; pub?: boolean }
+// Capture point. cap runs from -1 (owned by B) to +1 (owned by A)
+interface CapturePoint { id: string; x: number; y: number; cap: number; owner: Team | null; contested: boolean }
 
 interface Env {
   ROOM: DurableObjectNamespace;
@@ -83,6 +98,18 @@ function buildMap(): string[] {
 }
 
 const isWall = (px: number, py: number): boolean => isWallAt(GRID, px, py);
+
+// Capture point markers are part of the map data (ignored in elimination mode).
+// C sits at the map center; A (team A side) and B are point-symmetric about it
+const POINTS = (() => {
+  const cx = (MAP_W * TILE) / 2, cy = (MAP_H * TILE) / 2;
+  const a = { x: 12.5 * TILE, y: 5.5 * TILE };
+  return [
+    { id: "A", x: a.x, y: a.y },
+    { id: "B", x: 2 * cx - a.x, y: 2 * cy - a.y },
+    { id: "C", x: cx, y: cy },
+  ];
+})();
 
 function spawnPoint(team: Team, i: number) {
   const tx = 3, ty = 10 + i * 2;
@@ -120,6 +147,10 @@ export class Room extends DurableObject<Env> {
   events: GameEvent[] = [];
   timer: ReturnType<typeof setInterval> | null = null;
   botLevel = BOT_LEVEL_DEFAULT;
+  mode: Mode = MODE_DEFAULT;
+  points: CapturePoint[] = [];
+  score: Record<Team, number> = { A: 0, B: 0 };
+  lastTickAt = 0; // wall-clock time of the previous tick (s)
   intel: Record<Team, { last: TeamIntel | null }> = { A: { last: null }, B: { last: null } }; // bot の発見情報（レベル5）
   debug = { freezeBots: false };
   // 試合の進行
@@ -133,7 +164,7 @@ export class Room extends DurableObject<Env> {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     // 最初の1人が来たときに6枠を bot で用意する（部屋の設定は最初の人の指定を使う）
-    if (this.clients.size === 0) this.setupRoom(Number(url.searchParams.get("bot")));
+    if (this.clients.size === 0) this.setupRoom(Number(url.searchParams.get("bot")), url.searchParams.get("mode"));
     const type = toTankType(url.searchParams.get("tank"));
     const team = this.pickTeam();
     if (!team) return new Response("満員です", { status: 503 });
@@ -145,20 +176,25 @@ export class Room extends DurableObject<Env> {
     const c: Client = { id: crypto.randomUUID().slice(0, 8), ws: server, team, type, tank: null, seq: 0 };
     this.clients.set(c.id, c);
     // 対戦が始まる前なら bot の枠をすぐ引き継ぐ。対戦中は観戦して次のラウンドから参加する
-    if (this.phase === "wait" || this.phase === "countdown") this.seat(c);
+    // Conquest mode has no spectating: late joiners replace a bot immediately
+    if (this.phase === "wait" || this.phase === "countdown" || this.mode === "conquest") this.seat(c);
 
     server.addEventListener("message", (ev) => this.onMessage(c, ev.data));
     const leave = () => this.leave(c);
     server.addEventListener("close", leave);
     server.addEventListener("error", leave);
 
-    server.send(JSON.stringify({ t: "init", id: c.id, tile: TILE, map: MAP }));
+    server.send(JSON.stringify({
+      t: "init", id: c.id, tile: TILE, map: MAP, mode: this.mode,
+      points: this.mode === "conquest" ? POINTS.map((p) => ({ ...p, r: CONQUEST.radius })) : [],
+    }));
     this.startLoop();
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  setupRoom(botLevel: number) {
+  setupRoom(botLevel: number, mode: string | null) {
     this.botLevel = Number.isInteger(botLevel) && botLevel >= 1 && botLevel <= 5 ? botLevel : BOT_LEVEL_DEFAULT;
+    this.mode = mode === "conquest" || mode === "elim" ? mode : MODE_DEFAULT;
     this.debug = { freezeBots: false };
     this.newMatch(Date.now() / 1000);
     this.bullets = [];
@@ -168,7 +204,7 @@ export class Room extends DurableObject<Env> {
       for (let slot = 0; slot < TEAM_SIZE; slot++) {
         const t: Tank = {
           id: `${team}${slot}`, team, slot, type: BOT_TYPES[slot],
-          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0,
+          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0, respawnAt: 0,
           input: { ...IDLE }, human: null, bot: null, hit: null,
         };
         t.bot = this.newBot(t);
@@ -237,7 +273,7 @@ export class Room extends DurableObject<Env> {
     if (typeof data !== "string" || data.length > 200) return;
     let m: any;
     try { m = JSON.parse(data); } catch { return; }
-    if (m?.t === "dbg") return this.onDebug(m);
+    if (m?.t === "dbg") return this.onDebug(m, c);
     // 部屋主は待機中にすぐ開始できる
     if (m?.t === "start") {
       if (c === this.owner && this.phase === "wait") this.startRound(Date.now() / 1000);
@@ -253,17 +289,25 @@ export class Room extends DurableObject<Env> {
   }
 
   // 開発時だけ使えるテスト用コマンド（スモークテストで状況を作るため）
-  onDebug(m: any) {
+  onDebug(m: any, c: Client) {
     if (this.env.DEBUG_TOOLS !== "1") return;
     const now = Date.now() / 1000;
     if (typeof m.freezeBots === "boolean") this.debug.freezeBots = m.freezeBots;
     if (Number.isFinite(m.phaseSec)) this.phaseEndsAt = now + m.phaseSec; // いまの段階の残り時間を変える
     if (m.killTeam === "A" || m.killTeam === "B") {
-      for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; }
+      for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; t.respawnAt = now + CONQUEST.respawnSec; }
     }
     if ((m.hpTeam === "A" || m.hpTeam === "B") && Number.isInteger(m.hp)) {
       for (const t of this.tanks) if (t.team === m.hpTeam && !t.dead) t.hp = m.hp;
     }
+    // Teleport the sender's own tank (to stand in a capture zone)
+    if (c.tank && Number.isFinite(m.moveX) && Number.isFinite(m.moveY)) { c.tank.x = m.moveX; c.tank.y = m.moveY; }
+    // Set scores directly, and hand a capture point to a team
+    if (m.score && typeof m.score === "object") {
+      for (const team of TEAMS) if (Number.isFinite(m.score[team])) this.score[team] = m.score[team];
+    }
+    const p = this.points.find((p) => p.id === m.own?.id);
+    if (p && (m.own.team === "A" || m.own.team === "B")) { p.owner = m.own.team; p.cap = m.own.team === "A" ? 1 : -1; }
   }
 
   // ===== 試合の進行（殲滅モード） =====
@@ -273,6 +317,14 @@ export class Room extends DurableObject<Env> {
     this.round = 1;
     this.wins = { A: 0, B: 0 };
     this.roundResult = this.matchResult = null;
+    this.resetPoints();
+  }
+
+  resetPoints() {
+    this.score = { A: 0, B: 0 };
+    this.points = this.mode === "conquest"
+      ? POINTS.map((p) => ({ ...p, cap: 0, owner: null, contested: false }))
+      : [];
   }
 
   // ラウンド開始：観戦中の人を座らせ、全車を自陣に戻してカウントダウン
@@ -285,12 +337,21 @@ export class Room extends DurableObject<Env> {
     }
     this.bullets = [];
     this.roundResult = null;
+    this.resetPoints();
     this.phase = "countdown";
     this.phaseEndsAt = now + MATCH.countdownSec;
   }
 
   // 段階の切り替え。対戦中は毎ティック勝敗を判定する
   updatePhase(now: number) {
+    if (this.phase === "play" && this.mode === "conquest") {
+      // First to the target score wins; on timeout the higher score wins
+      const { A, B } = this.score;
+      if (A >= CONQUEST.target || B >= CONQUEST.target || now >= this.phaseEndsAt) {
+        this.endMatch(now, A > B ? "A" : B > A ? "B" : "draw");
+      }
+      return;
+    }
     if (this.phase === "play") {
       const alive = (team: Team) => this.tanks.filter((t) => t.team === team && !t.dead);
       const a = alive("A"), b = alive("B");
@@ -306,18 +367,46 @@ export class Room extends DurableObject<Env> {
     }
     if (now < this.phaseEndsAt) return;
     if (this.phase === "wait") this.startRound(now);
-    else if (this.phase === "countdown") { this.phase = "play"; this.phaseEndsAt = now + MATCH.roundSec; }
+    else if (this.phase === "countdown") {
+      this.phase = "play";
+      this.phaseEndsAt = now + (this.mode === "conquest" ? CONQUEST.roundSec : MATCH.roundSec);
+    }
     else if (this.phase === "roundEnd") {
       const done = this.wins.A >= MATCH.winRounds || this.wins.B >= MATCH.winRounds || this.round >= MATCH.maxRounds;
       if (done) {
-        this.matchResult = this.wins.A > this.wins.B ? "A" : this.wins.B > this.wins.A ? "B" : "draw";
-        this.phase = "matchEnd";
-        this.phaseEndsAt = now + MATCH.matchEndSec;
+        this.endMatch(now, this.wins.A > this.wins.B ? "A" : this.wins.B > this.wins.A ? "B" : "draw");
       } else {
         this.round++;
         this.startRound(now);
       }
     } else if (this.phase === "matchEnd") this.newMatch(now);
+  }
+
+  endMatch(now: number, result: Result) {
+    this.matchResult = result;
+    this.phase = "matchEnd";
+    this.phaseEndsAt = now + MATCH.matchEndSec;
+  }
+
+  // Capture progress: moves only while exactly one team has live tanks in the zone.
+  // Contested (both teams present) or empty zones keep their progress
+  updatePoints(dt: number) {
+    for (const p of this.points) {
+      const inside = (team: Team) =>
+        this.tanks.some((t) => t.team === team && !t.dead && Math.hypot(t.x - p.x, t.y - p.y) <= CONQUEST.radius);
+      const a = inside("A"), b = inside("B");
+      p.contested = a && b;
+      if (a !== b) {
+        const before = p.owner;
+        p.cap = Math.max(-1, Math.min(1, p.cap + (a ? 1 : -1) * (dt / CONQUEST.captureSec)));
+        // Crossing zero neutralizes the enemy's point; reaching +-1 captures it
+        if ((p.owner === "A" && p.cap <= 0) || (p.owner === "B" && p.cap >= 0)) p.owner = null;
+        if (p.cap >= 1) p.owner = "A";
+        if (p.cap <= -1) p.owner = "B";
+        if (p.owner && p.owner !== before) this.events.push({ e: "cap", x: p.x, y: p.y, team: p.owner, pub: true });
+      }
+      if (p.owner) this.score[p.owner] += dt * CONQUEST.scorePerSec;
+    }
   }
 
   endRound(now: number, result: Result) {
@@ -334,6 +423,7 @@ export class Room extends DurableObject<Env> {
   stopLoop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.lastTickAt = 0;
     this.tanks = [];
     this.bullets = [];
   }
@@ -352,6 +442,10 @@ export class Room extends DurableObject<Env> {
   tick() {
     const now = Date.now() / 1000;
     const dt = TICK_MS / 1000;
+    // Movement uses the fixed step (same as client prediction), but capture progress and score use
+    // real elapsed time: timers can fire a bit slower than 20Hz, and the time limit is wall-clock
+    const realDt = this.lastTickAt ? Math.min(0.25, Math.max(0, now - this.lastTickAt)) : dt;
+    this.lastTickAt = now;
     this.updatePhase(now);
     this.thinkBots(now);
 
@@ -359,7 +453,10 @@ export class Room extends DurableObject<Env> {
     // 待機中は動けるが撃てない（ウォームアップ）。カウントダウンと結果表示の間は止まる
     const canMove = this.phase === "wait" || this.phase === "play";
     const canFire = this.phase === "play";
+    if (this.phase === "play" && this.mode === "conquest") this.updatePoints(realDt);
     for (const t of this.tanks) {
+      // Conquest: destroyed tanks come back at their own base after a delay
+      if (t.dead && this.mode === "conquest" && this.phase === "play" && now >= t.respawnAt) this.spawn(t);
       if (t.dead || !canMove) continue;
       stepTank(GRID, t, t.input.mx, t.input.my, dt);
       // 砲塔は入力の向きへ、車種ごとの旋回速度の上限で回す
@@ -395,6 +492,7 @@ export class Room extends DurableObject<Env> {
           t.hit = { dir: Math.atan2(-b.vy, -b.vx), at: now };
           if (t.hp === 0) {
             t.dead = true; // 殲滅モードでは復活しない（次のラウンドで戻る）
+            t.respawnAt = now + CONQUEST.respawnSec; // used only in conquest mode
             this.events.push({ e: "kill", x: r1(t.x), y: r1(t.y), team: t.team });
           } else {
             this.events.push({ e: "hit", x: r1(t.x), y: r1(t.y), team: t.team });
@@ -430,11 +528,16 @@ export class Room extends DurableObject<Env> {
       me: c.tank ? c.tank.id : null, // 自分の戦車（観戦中は null）
       view: v.id, // 視界の元にした戦車
       team: c.team,
+      rs: c.tank?.dead && this.mode === "conquest" ? Math.max(0, Math.ceil(c.tank.respawnAt - now)) : 0, // seconds until respawn
       // 試合の状態（座標は含まないので全員に送る）
       g: {
         ph: this.phase, t: Math.max(0, Math.ceil(this.phaseEndsAt - now)), r: this.round,
         w: [this.wins.A, this.wins.B], wr: MATCH.winRounds, al: [alive("A"), alive("B")],
         rr: this.roundResult, mr: this.matchResult, owner: c === this.owner,
+        mode: this.mode,
+        // Conquest: scores and capture point states (no coordinates, so public)
+        sc: [Math.floor(this.score.A), Math.floor(this.score.B)], tg: CONQUEST.target,
+        pts: this.points.map((p) => ({ id: p.id, o: p.owner, p: r2(p.cap), c: p.contested })),
       },
       tanks: this.tanks
         .filter((t) => t.team === v.team || (!t.dead && canSeeTank(GRID, v, t)))
@@ -446,8 +549,9 @@ export class Room extends DurableObject<Env> {
         .filter((b) => b.team === v.team || seen(b.x, b.y))
         .map((b) => [Math.round(b.x), Math.round(b.y)]),
       ev: this.events
-        .filter((e) => e.team === v.team || seen(e.x, e.y))
-        .map(({ e, x, y }) => ({ e, x, y })),
+        .filter((e) => e.pub || e.team === v.team || seen(e.x, e.y))
+        // Public events keep their team (who captured); others drop it
+        .map(({ e, x, y, team, pub }) => (pub ? { e, x, y, team } : { e, x, y })),
     });
   }
 }

@@ -43,6 +43,7 @@ const fog = fogCv.getContext("2d");
 
 // ===== 状態 =====
 let ws = null, myId = null, map = [], grid = null;
+let points = []; // capture points {id, x, y, r} (conquest mode only; states come in each snapshot)
 let prev = null, curr = null, currAt = 0;
 let audio = null;
 const keys = new Set();
@@ -108,13 +109,18 @@ function showOverlay(text) {
 }
 
 function connect() {
-  const room = new URLSearchParams(location.search).get("room") || "default";
+  const params = new URLSearchParams(location.search);
+  const room = params.get("room") || "default";
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws?room=${encodeURIComponent(room)}&tank=${tankType}`);
+  // Room settings (?mode=, ?bot=) are passed through; the server uses them only from the first player
+  const q = new URLSearchParams({ room, tank: tankType });
+  for (const key of ["mode", "bot"]) if (params.has(key)) q.set(key, params.get(key));
+  ws = new WebSocket(`${proto}://${location.host}/ws?${q}`);
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
       myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
+      points = m.points || [];
       pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
       if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
@@ -332,6 +338,44 @@ const fmtTime = (sec) => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2,
 // 自分のチームから見た結果
 const resultText = (r) => (r === "draw" ? "引き分け" : r === curr.team ? "勝利" : "敗北");
 
+const MODE_NAME = { elim: "殲滅モード", conquest: "拠点制圧モード" };
+const ownerColor = (o) => (o ? PALETTE[o] : "#8a8778");
+
+// Capture zones: ring in the owner's color, arc = capture progress of the leading team.
+// Drawn above the fog because point states are public
+function drawPoints() {
+  for (const p of points) {
+    const st = curr.g.pts.find((q) => q.id === p.id);
+    if (!st) continue;
+    const x = Math.round(p.x - cam.x), y = Math.round(p.y - cam.y);
+    ctx.globalAlpha = st.c && Math.floor(performance.now() / 250) % 2 ? 0.35 : 0.8; // blink while contested
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = ownerColor(st.o);
+    ctx.beginPath(); ctx.arc(x, y, p.r, 0, Math.PI * 2); ctx.stroke();
+    if (st.p !== 0 && Math.abs(st.p) < 1) {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = PALETTE[st.p > 0 ? "A" : "B"];
+      ctx.beginPath(); ctx.arc(x, y, p.r - 2, -Math.PI / 2, -Math.PI / 2 + Math.abs(st.p) * Math.PI * 2); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+// Point letters are text, so they go on the high-resolution HUD layer
+function drawPointLabels() {
+  hud.font = "8px DotGothic16, monospace";
+  hud.textAlign = "center";
+  hud.textBaseline = "middle";
+  for (const p of points) {
+    const st = curr.g.pts.find((q) => q.id === p.id);
+    if (!st) continue;
+    hud.fillStyle = ownerColor(st.o);
+    hud.fillText(p.id, p.x - cam.x, p.y - cam.y);
+  }
+  hud.textAlign = "left";
+  hud.textBaseline = "top";
+}
+
 // 案内の帯。cy は帯の中心の高さ（既定は画面中央）
 function banner(lines, big = false, cy = H / 2) {
   const h = big ? 28 : 12 * lines.length + 8;
@@ -354,11 +398,19 @@ function drawHud(me) {
   hud.font = "8px DotGothic16, monospace";
   hud.textBaseline = "top";
   hud.fillStyle = "rgba(0,0,0,0.5)"; hud.fillRect(0, 0, W, 12);
-  // 左：ラウンド、各チームの勝ち数（●）と生存数
-  const marks = (n) => "●".repeat(n) + "○".repeat(Math.max(0, g.wr - n));
-  hud.fillStyle = "#c9c4b3"; hud.fillText(`R${g.r}`, 4, 2);
-  hud.fillStyle = PALETTE.A; hud.fillText(`A ${marks(g.w[0])} ${g.al[0]}機`, 22, 2);
-  hud.fillStyle = PALETTE.B; hud.fillText(`B ${marks(g.w[1])} ${g.al[1]}機`, 82, 2);
+  if (g.mode === "conquest") {
+    // Left: scores toward the target, then each point's owner
+    hud.fillStyle = PALETTE.A; hud.fillText(`A ${g.sc[0]}`, 4, 2);
+    hud.fillStyle = PALETTE.B; hud.fillText(`B ${g.sc[1]}`, 38, 2);
+    hud.fillStyle = "#c9c4b3"; hud.fillText(`/ ${g.tg}`, 72, 2);
+    g.pts.forEach((p, i) => { hud.fillStyle = ownerColor(p.o); hud.fillText(p.c ? `${p.id}!` : p.id, 100 + i * 12, 2); });
+  } else {
+    // 左：ラウンド、各チームの勝ち数（●）と生存数
+    const marks = (n) => "●".repeat(n) + "○".repeat(Math.max(0, g.wr - n));
+    hud.fillStyle = "#c9c4b3"; hud.fillText(`R${g.r}`, 4, 2);
+    hud.fillStyle = PALETTE.A; hud.fillText(`A ${marks(g.w[0])} ${g.al[0]}機`, 22, 2);
+    hud.fillStyle = PALETTE.B; hud.fillText(`B ${marks(g.w[1])} ${g.al[1]}機`, 82, 2);
+  }
   // 中央：残り時間
   hud.textAlign = "center";
   hud.fillStyle = "#c9c4b3";
@@ -373,7 +425,7 @@ function drawHud(me) {
 
   if (g.ph === "wait") {
     banner([
-      `待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
+      `${MODE_NAME[g.mode]}　待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
       g.owner ? "Enter キーで今すぐ開始　／　ウォームアップ中は撃てません" : "部屋主の開始を待っています　／　ウォームアップ中は撃てません",
     ], false, H - 20); // 自機に重ならないよう画面下に出す
   } else if (g.ph === "countdown") {
@@ -381,11 +433,14 @@ function drawHud(me) {
   } else if (g.ph === "roundEnd") {
     banner([`ラウンド${g.r}　${resultText(g.rr)}`, g.rr === "draw" ? "" : `${TEAM_NAME[g.rr]}の勝ち`]);
   } else if (g.ph === "matchEnd") {
-    banner([`試合終了　${resultText(g.mr)}`, `A ${g.w[0]} - ${g.w[1]} B　まもなく次の試合の待機に戻ります`]);
+    const score = g.mode === "conquest" ? `A ${g.sc[0]} - ${g.sc[1]} B` : `A ${g.w[0]} - ${g.w[1]} B`;
+    banner([`試合終了　${resultText(g.mr)}`, `${score}　まもなく次の試合の待機に戻ります`]);
   }
   // 観戦の案内（画面下）
   const note = !me ? "観戦中：次のラウンドから参加します（味方の視点のみ）"
-    : me.dead && g.ph === "play" ? "撃破されました　味方の視点で観戦中" : "";
+    : me.dead && g.ph === "play"
+      ? (g.mode === "conquest" ? `撃破されました　${curr.rs} 秒後に自陣で復活します` : "撃破されました　味方の視点で観戦中")
+      : "";
   if (note) {
     hud.fillStyle = "rgba(0,0,0,0.5)"; hud.fillRect(0, H - 14, W, 14);
     hud.fillStyle = PALETTE.flare; hud.textAlign = "center";
@@ -424,7 +479,9 @@ function frame() {
   drawFog(view, view ? view.a : 0);
   ctx.fillStyle = PALETTE.bullet;
   for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
+  drawPoints();
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);
+  drawPointLabels();
   drawHud(me);
   requestAnimationFrame(frame);
 }
@@ -469,6 +526,12 @@ function playPhase(g, team) {
 
 function playEvent(e) {
   if (!audio || !curr) return;
+  // Capture point changed owner: heard everywhere, rising for us, falling for them
+  if (e.e === "cap") {
+    if (e.team === curr.team) tone(660, 990, 0.25, "triangle", 0.7);
+    else tone(500, 250, 0.3, "triangle", 0.7);
+    return;
+  }
   // 音の距離は、いま見ている視点（自機、または観戦中の味方）から測る
   const me = curr.tanks.find((k) => k.id === curr.view);
   const dist = me ? Math.hypot(me.x - e.x, me.y - e.y) : 0;

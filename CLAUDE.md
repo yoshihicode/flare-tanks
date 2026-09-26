@@ -4,9 +4,9 @@ Cloudflare Workers 無料プランだけで動く、ブラウザ向けトップ�
 仕様書（正本）：`docs/spec.md`。仕様を変更したら必ずこのファイルも更新する
 
 ## コマンド
-- `npm run dev`：ローカル起動（http://localhost:8787、`?room=名前` で部屋分け、`?bot=1〜5` で部屋の bot の強さ）
-  - 開発時だけデバッグ用コマンド（`{t:"dbg"}`：bot停止・段階の残り時間変更・全滅・HP設定）が有効（`--var DEBUG_TOOLS:1`）。デプロイ版では無効
-- `npm run test:smoke`：自動テスト（dev起動中に別ターミナルで実行、約20秒）。3部屋を並行で使い、撃ち合い・視界・bot・殲滅モードの流れを確認する。bot 単体の確認（`scripts/bot-checks.mjs`）も含む
+- `npm run dev`：ローカル起動（http://localhost:8787、`?room=名前` で部屋分け、`?bot=1〜5` で部屋の bot の強さ、`?mode=conquest` で拠点制圧モード。部屋の設定は最初に入った人の指定を使う）
+  - 開発時だけデバッグ用コマンド（`{t:"dbg"}`：bot停止・段階の残り時間変更・全滅・HP設定・自機の瞬間移動・ポイント設定・拠点の持ち主設定）が有効（`--var DEBUG_TOOLS:1`）。デプロイ版では無効
+- `npm run test:smoke`：自動テスト（dev起動中に別ターミナルで実行、約25秒）。4部屋を並行で使い、撃ち合い・視界・bot・殲滅モードと拠点制圧モードの流れを確認する。bot 単体の確認（`scripts/bot-checks.mjs`）も含む
 - `npm run deploy`：Cloudflareへデプロイ（事前に `npx wrangler login`）
 
 ## 構成
