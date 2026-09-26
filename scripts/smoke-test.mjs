@@ -8,6 +8,8 @@ import {
 import { botChecks } from "./bot-checks.mjs";
 import { updateGhosts, GHOST } from "../public/ghosts.js";
 import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "../public/touch.js";
+import { sample, pushSnapshot, INTERP } from "../public/interp.js";
+import { minimapLayout, minimapDots, MINIMAP } from "../public/minimap.js";
 import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
 import { LOBBY, pickQuick, expired, newCode, rateLimited, overBudget, publicList } from "../src/lobby.ts";
 import { DEFAULT_SETTINGS } from "../src/settings.ts";
@@ -581,6 +583,31 @@ const touchChecks = (() => {
   ].map(([n, ok, d]) => [n, ok, d]);
 })();
 
+// Interpolation buffer and minimap (public/interp.js, public/minimap.js), checked without a browser
+const clientChecks = (() => {
+  const tk = (id, x, extra = {}) => ({ id, team: "B", k: "medium", x, y: 0, b: 0, a: 0, hp: 100, dead: false, ...extra });
+  const snap = (tanks) => ({ team: "A", me: "A0", tanks, bullets: [], ev: [], pins: [] });
+  const buf = [];
+  pushSnapshot(buf, snap([tk("B0", 0), tk("B1", 50)]), 1000);
+  pushSnapshot(buf, snap([tk("B0", 30), tk("B2", 90)]), 1050);
+  const mid = sample(buf, 1025);
+  const late = sample(buf, 2000);
+  for (let i = 0; i < INTERP.keep + 5; i++) pushSnapshot(buf, snap([]), 3000 + i);
+  const layout = minimapLayout(40, 24);
+  const ghosts = new Map([["B5", { tank: tk("B5", 7), at: 0 }]]);
+  const dots = minimapDots(snap([{ ...tk("A0", 1), team: "A" }, tk("B0", 2), tk("B9", 3, { dead: true })]), ghosts);
+  return [
+    ["補間：前後のスナップショットの間を補間し、見えなくなった戦車は描かない",
+      mid.tanks.find((k) => k.id === "B0")?.x === 15 && !mid.tanks.some((k) => k.id === "B1") && mid.tanks.some((k) => k.id === "B2"),
+      JSON.stringify(mid.tanks.map((k) => [k.id, k.x]))],
+    ["補間：最新より先は先読みせず最新のまま、古いものは捨てる",
+      late.tanks.find((k) => k.id === "B0")?.x === 30 && buf.length === INTERP.keep, ""],
+    ["ミニマップ：画面上部の枠に収まる大きさ", layout.w <= MINIMAP.maxW && layout.h <= MINIMAP.maxH && layout.w > 50, `${layout.w.toFixed(0)}x${layout.h.toFixed(0)}`],
+    ["ミニマップ：味方・見えている敵・残像だけ（撃破された戦車は出さない）",
+      dots.map((d) => `${d.kind}:${d.x}`).join() === "ally:1,enemy:2,ghost:7" && dots[0].me, JSON.stringify(dots.map((d) => d.kind))],
+  ];
+})();
+
 // 確認項目の集計
 const events = new Set();
 let snaps = 0;
@@ -729,6 +756,7 @@ b.onSnap = (m) => {
     ["被弾方向は撃った相手の方を向く", st.hurts > 0 && st.hurtBad.length === 0, `hurts=${st.hurts} bad=${st.hurtBad.length}`],
     ...ghostChecks,
     ...touchChecks,
+    ...clientChecks,
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);

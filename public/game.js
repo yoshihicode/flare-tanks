@@ -1,5 +1,7 @@
 import { updateGhosts, GHOST } from "./ghosts.js";
 import { STICK, stickVector, moveFromStick, aimFromStick, assistAim } from "./touch.js";
+import { INTERP, sample, pushSnapshot } from "./interp.js";
+import { MINIMAP, minimapLayout, minimapDots } from "./minimap.js";
 import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
@@ -327,13 +329,28 @@ async function enterRoom(id, adhoc = false) {
   connect(id, adhoc, ts);
 }
 
+// App switch / screen lock (spec: treat as a disconnect; a bot takes over). Coming back within the
+// reconnect window rejoins the same room automatically, which gives the tank back
+let hiddenAt = 0;
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    if (!ws || !inGame()) return;
+    hiddenAt = performance.now();
+    leaveRoom("画面を離れたため切断しました。");
+  } else if (hiddenAt && lastRoom && performance.now() - hiddenAt < REJOIN_WITHIN_MS) {
+    hiddenAt = 0;
+    rejoinBtn.click();
+  }
+});
+const REJOIN_WITHIN_MS = 28000; // a little under the server's 30 s hold on the tank
+
 // Esc (or the leave button) goes back to the lobby right away, without waiting for the close handshake
-function leaveRoom() {
+function leaveRoom(message) {
   if (!ws) return;
   const sock = ws;
   sock.onclose = null;
   sock.close(1000);
-  roomClosed(1000, true);
+  roomClosed(1000, true, message);
 }
 addEventListener("keydown", (e) => {
   if (e.code === "Escape" && ws && overlay.style.display === "none") leaveRoom();
@@ -353,6 +370,8 @@ function connect(roomId, adhoc, ts) {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
       myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
+      snapBuffer = [];
+      buildMinimap();
       pred = null; history = []; sentAt.clear();
       points = m.points || [];
       settings = m.settings;
@@ -375,6 +394,7 @@ function connect(roomId, adhoc, ts) {
         if (audio && curr) tone(1200, 1500, 0.08, "square", 0.5); // new pin from the team (skip on first snapshot)
       }
       prev = curr; curr = m; currAt = performance.now();
+      pushSnapshot(snapBuffer, m, currAt);
       myId = m.me; // 自分が操作している戦車（bot の枠を引き継ぐので接続IDとは別。観戦中は null）
       reconcile(m);
       m.ev.forEach(playEvent);
@@ -384,7 +404,7 @@ function connect(roomId, adhoc, ts) {
 }
 
 // Back to the lobby with the reason. Close codes come from the server (see src/index.ts)
-function roomClosed(code, leftOnPurpose) {
+function roomClosed(code, leftOnPurpose, message) {
   ws = null;
   curr = prev = null;
   playersPanel.style.display = "none";
@@ -396,7 +416,7 @@ function roomClosed(code, leftOnPurpose) {
     4005: "この部屋からは追放されました。",
   }[code] ?? "接続が切れました。30秒以内なら「さっきの部屋に戻る」で同じ戦車に戻れます。";
   if ([4003, 4404, 4005].includes(code)) lastRoom = null;
-  showScreen("lobby", why);
+  showScreen("lobby", message ?? why);
 }
 
 // ===== Players panel (Tab): invite code / link, and kick for the owner =====
@@ -652,20 +672,53 @@ function reconcile(m) {
 }
 
 // ===== 補間 =====
-const lerp = (a, b, t) => a + (b - a) * t;
-function lerpAngle(a, b, t) {
-  const d = ((((b - a) % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
-  return a + d * t;
+// Other tanks and bullets are drawn slightly in the past from a snapshot buffer (see interp.js)
+let snapBuffer = [];
+function interpolated() {
+  const delay = touchMode ? INTERP.touchDelayMs : INTERP.delayMs;
+  return sample(snapBuffer, performance.now() - delay) ?? { snap: curr, tanks: curr.tanks };
 }
-function interpolatedTanks() {
-  if (!curr) return [];
-  const t = Math.min(1, (performance.now() - currAt) / 50);
-  const before = new Map((prev ? prev.tanks : []).map((k) => [k.id, k]));
-  return curr.tanks.map((k) => {
-    const p = before.get(k.id);
-    if (!p || p.dead !== k.dead) return k;
-    return { ...k, x: lerp(p.x, k.x, t), y: lerp(p.y, k.y, t), b: lerpAngle(p.b, k.b, t), a: lerpAngle(p.a, k.a, t) };
-  });
+
+// ===== Minimap (top-left): walls pre-rendered once per map, then dots each frame =====
+const mmCv = document.createElement("canvas");
+const mm = mmCv.getContext("2d");
+let mmLayout = null;
+function buildMinimap() {
+  mmLayout = minimapLayout(map[0].length, map.length);
+  mmCv.width = Math.ceil(mmLayout.w);
+  mmCv.height = Math.ceil(mmLayout.h);
+  mm.fillStyle = "rgba(10, 14, 11, 0.75)";
+  mm.fillRect(0, 0, mmCv.width, mmCv.height);
+  mm.fillStyle = "rgba(143, 139, 120, 0.9)";
+  for (let ty = 0; ty < map.length; ty++) {
+    for (let tx = 0; tx < map[0].length; tx++) {
+      if (map[ty][tx] === "#") mm.fillRect(tx * mmLayout.scale, ty * mmLayout.scale, Math.ceil(mmLayout.scale), Math.ceil(mmLayout.scale));
+    }
+  }
+}
+function drawMinimap() {
+  if (!mmLayout) return;
+  const k = mmLayout.scale / TILE; // world px -> minimap units
+  const ox = MINIMAP.x, oy = MINIMAP.y;
+  ctx.drawImage(mmCv, ox, oy);
+  for (const p of points) {
+    const st = curr.g.pts.find((q) => q.id === p.id);
+    ctx.strokeStyle = ownerColor(st?.o);
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(ox + p.x * k, oy + p.y * k, Math.max(2, p.r * k), 0, Math.PI * 2); ctx.stroke();
+  }
+  for (const d of minimapDots(curr, ghosts)) {
+    ctx.globalAlpha = d.kind === "ghost" ? 0.4 : 1;
+    ctx.fillStyle = d.me ? PALETTE.flare : PALETTE[d.team];
+    const size = d.me ? 3 : 2;
+    ctx.fillRect(Math.round(ox + d.x * k - size / 2), Math.round(oy + d.y * k - size / 2), size, size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = PALETTE.flare;
+  for (const pin of curr.pins) ctx.fillRect(Math.round(ox + pin.x * k) - 1, Math.round(oy + pin.y * k) - 1, 2, 2);
+  // What the screen currently shows
+  ctx.strokeStyle = "rgba(233, 228, 212, 0.5)";
+  ctx.strokeRect(Math.round(ox + cam.x * k) + 0.5, Math.round(oy + cam.y * k) + 0.5, Math.round(W * k), Math.round(H * k));
 }
 
 // ===== 描画 =====
@@ -985,7 +1038,8 @@ function frame() {
   predict(dt);
   lastFrameAt = nowMs;
   // 自機は予測位置で描く（スナップショット本体は補正に使うので書き換えない）
-  const tanks = interpolatedTanks().map((k) => (k.id === myId && pred ? { ...k, x: pred.x, y: pred.y, b: pred.body } : k));
+  const shown = interpolated();
+  const tanks = shown.tanks.map((k) => (k.id === myId && pred ? { ...k, x: pred.x, y: pred.y, b: pred.body } : k));
   const me = tanks.find((k) => k.id === myId);
   // 視界とカメラの元：自分が生きていれば自機、撃破中・観戦中はサーバーが選んだ味方
   const view = tanks.find((k) => k.id === curr.view) || me;
@@ -1002,7 +1056,7 @@ function frame() {
   drawMap();
   drawFog(view, view ? view.a : 0);
   ctx.fillStyle = PALETTE.bullet;
-  for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
+  for (const [bx, by] of shown.snap.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
   drawPoints();
   drawGhosts();
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);
@@ -1010,6 +1064,7 @@ function frame() {
   drawMarks(view);
   drawPointLabels();
   drawNames(tanks);
+  drawMinimap();
   drawHud(me);
   drawSticks();
   syncSettingsPanel();
