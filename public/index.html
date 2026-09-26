@@ -50,15 +50,23 @@
     #tanks button b { display: block; font-weight: 400; font-size: 1.1rem; color: var(--flare); }
     #tanks button small { opacity: 0.75; }
     #tanks button[aria-pressed="true"] { border-color: var(--flare); background: rgba(255, 179, 71, 0.12); }
+    #tanks button:active, #tanks button[aria-busy="true"] { background: rgba(255, 179, 71, 0.3); }
     #tanks button:focus-visible { outline: 2px solid var(--flare); outline-offset: 2px; }
     /* Room settings panel: shown to the room owner while waiting */
     #settings {
       position: absolute; top: 3.2rem; right: 1rem; display: none;
       background: rgba(10, 14, 11, 0.9); border: 2px solid #4a483e; padding: 0.6rem 0.8rem;
-      font-size: 0.9rem; line-height: 2; min-width: 14rem;
+      font-size: 0.9rem; min-width: 16rem;
     }
     #settings h2 { margin: 0 0 0.2rem; font-size: 1rem; font-weight: 400; color: var(--flare); }
     #settings select, #settings input { font: inherit; color: var(--ash); background: #1b2419; border: 1px solid #4a483e; }
+    /* One setting per row: label on the left, a fixed-width control on the right, with space between rows */
+    #createForm label, #settings label {
+      display: grid; grid-template-columns: 1fr 8.5rem; align-items: center; column-gap: 1rem;
+      margin: 0.4rem 0; line-height: 1.4;
+    }
+    #createForm select, #settings select { width: 100%; padding: 0.15rem 0.3rem; }
+    #createForm input[type="checkbox"], #settings input[type="checkbox"] { justify-self: start; width: 1.1rem; height: 1.1rem; margin: 0; }
     #settings select:focus-visible, #settings input:focus-visible { outline: 2px solid var(--flare); }
     /* Buttons and inputs in the title / lobby screens */
     .btn, #lobby input {
@@ -67,6 +75,16 @@
     }
     .btn.primary { border-color: var(--flare); color: var(--flare); }
     .btn:hover { background: rgba(255, 179, 71, 0.12); }
+    .btn:active { transform: translateY(1px); background: rgba(255, 179, 71, 0.25); }
+    /* A button whose action is in progress (joining can take a few seconds) */
+    .btn[aria-busy="true"] {
+      border-color: var(--flare); background: rgba(255, 179, 71, 0.3); color: #fff3c4; cursor: progress;
+    }
+    .btn:disabled:not([aria-busy="true"]) { opacity: 0.5; cursor: not-allowed; }
+    @media (prefers-reduced-motion: no-preference) {
+      .btn[aria-busy="true"] { animation: pulse 0.9s ease-in-out infinite; }
+      @keyframes pulse { 50% { background: rgba(255, 179, 71, 0.12); } }
+    }
     .btn:focus-visible, #lobby input:focus-visible { outline: 2px solid var(--flare); outline-offset: 2px; }
     #lobby { display: flex; flex-direction: column; gap: 0.9rem; width: min(40rem, 100%); cursor: default; }
     #lobby[hidden], #title[hidden], #createForm[hidden] { display: none; }
@@ -77,10 +95,9 @@
     #rooms li { display: flex; justify-content: space-between; align-items: center; gap: 0.8rem; padding: 0.45rem 0.3rem; border-bottom: 1px solid #2c3328; }
     #rooms .meta { font-size: 0.85rem; opacity: 0.8; }
     #rooms .empty { justify-content: center; opacity: 0.7; }
-    #createForm, #settings { line-height: 2; }
     #createForm { border: 2px solid #4a483e; padding: 0.6rem 1rem; text-align: left; }
-    #createForm label, #settings label { display: flex; justify-content: space-between; gap: 1rem; }
     #createForm select { font: inherit; color: var(--ash); background: #1b2419; border: 1px solid #4a483e; }
+    #createForm .row { margin-top: 0.6rem; }
     #title { display: flex; flex-direction: column; align-items: center; gap: 1.25rem; }
     /* Players panel (Tab): invite code and kick */
     #players {

@@ -82,7 +82,11 @@ for (const type of TANK_ORDER) {
   btn.type = "button";
   btn.dataset.type = type;
   btn.innerHTML = `<b>${s.name}</b><small>${s.role}<br>HP ${s.hp}・ダメージ ${s.damage}<br>視野角 ${Math.round((s.fov * 180) / Math.PI)}°</small>`;
-  btn.addEventListener("click", () => { chooseTank(type); goLobby(); });
+  btn.addEventListener("click", async () => {
+    chooseTank(type);
+    btn.setAttribute("aria-busy", "true"); // show the click registered while we sign in
+    try { await goLobby(); } finally { btn.removeAttribute("aria-busy"); }
+  });
   tankButtons.append(btn);
 }
 function chooseTank(type) {
@@ -200,11 +204,16 @@ async function goLobby() {
   }
   // Links straight into a room: ?code=123456 (invite) or ?room=name (dev-only ad-hoc room)
   const params = new URLSearchParams(location.search);
-  if (params.has("room")) return withLobbyError(enterRoom)(params.get("room"), true);
-  if (params.has("code")) {
-    const code = params.get("code");
-    window.history.replaceState(null, "", location.pathname); // don't auto-join again after leaving (a local "history" shadows it)
-    return joinByCode(code);
+  // If a direct link fails, open the lobby with the reason
+  try {
+    if (params.has("room")) return await enterRoom(params.get("room"), true);
+    if (params.has("code")) {
+      const code = params.get("code");
+      window.history.replaceState(null, "", location.pathname); // don't auto-join again after leaving (a local "history" shadows it)
+      return await joinByCode(code);
+    }
+  } catch (e) {
+    return showScreen("lobby", e.message);
   }
   showScreen("lobby");
 }
@@ -222,7 +231,11 @@ function closeLobby() {
   lobbyWs = null;
 }
 
+let pendingRooms = null; // a list update that arrived while a lobby action was in progress
 function renderRooms(rooms) {
+  // Don't swap out the buttons under the player's click while they're joining
+  if (lobbyBusy) { pendingRooms = rooms; return; }
+  pendingRooms = null;
   roomList.replaceChildren();
   if (!rooms.length) {
     const li = document.createElement("li");
@@ -241,33 +254,54 @@ function renderRooms(rooms) {
     btn.type = "button";
     btn.textContent = r.humans >= r.capacity ? "満員" : "参加";
     btn.disabled = r.humans >= r.capacity;
-    btn.addEventListener("click", withLobbyError(() => enterRoom(r.id)));
+    btn.addEventListener("click", busyButton(btn, "接続中…", () => enterRoom(r.id)));
     li.append(info, btn);
     roomList.append(li);
   }
 }
 
-const withLobbyError = (fn) => async (...args) => {
-  try { await fn(...args); } catch (e) { lobbyMsg.textContent = e.message; }
-};
-const joinByCode = withLobbyError(async (code) => {
+// Joining takes a few seconds (Turnstile + connecting), so show that the click registered:
+// the button changes its text and color, and other lobby actions wait until this one finishes
+let lobbyBusy = false;
+function busyButton(btn, text, fn) {
+  return async (...args) => {
+    if (lobbyBusy) return;
+    lobbyBusy = true;
+    const label = btn.textContent;
+    btn.setAttribute("aria-busy", "true");
+    btn.disabled = true;
+    btn.textContent = text;
+    lobbyMsg.textContent = "";
+    try {
+      await fn(...args);
+    } catch (e) {
+      lobbyMsg.textContent = e.message;
+    } finally {
+      lobbyBusy = false;
+      btn.removeAttribute("aria-busy");
+      btn.disabled = false;
+      btn.textContent = label;
+      if (pendingRooms) renderRooms(pendingRooms);
+    }
+  };
+}
+
+const joinByCode = async (code) => {
   if (!/^\d{6}$/.test(code)) throw new Error("招待コードは6桁の数字です");
   const { id } = await api("/api/code", { code });
   await enterRoom(id);
-});
-document.getElementById("quick").addEventListener("click", withLobbyError(async () => {
-  lobbyMsg.textContent = "部屋を探しています…";
+};
+const quickBtn = document.getElementById("quick");
+quickBtn.addEventListener("click", busyButton(quickBtn, "部屋を探しています…", async () => {
   await enterRoom((await api("/api/quick", { ts: await humanToken() })).id);
 }));
 document.getElementById("create").addEventListener("click", () => { createForm.hidden = false; });
 document.getElementById("cancelCreate").addEventListener("click", () => { createForm.hidden = true; });
 document.getElementById("back").addEventListener("click", () => showScreen("title"));
-document.getElementById("codeForm").addEventListener("submit", (e) => {
-  e.preventDefault();
-  joinByCode(document.getElementById("code").value.trim());
-});
-createForm.addEventListener("submit", withLobbyError(async (e) => {
-  e.preventDefault();
+const codeForm = document.getElementById("codeForm");
+const joinCode = busyButton(codeForm.querySelector("button"), "接続中…", () => joinByCode(document.getElementById("code").value.trim()));
+codeForm.addEventListener("submit", (e) => { e.preventDefault(); joinCode(); });
+const createRoom = busyButton(createForm.querySelector("button[type=submit]"), "作成中…", async () => {
   const f = createForm.elements;
   const settings = {
     mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value),
@@ -276,8 +310,9 @@ createForm.addEventListener("submit", withLobbyError(async (e) => {
   const { id } = await api("/api/rooms", { settings, ts: await humanToken() });
   createForm.hidden = true;
   await enterRoom(id);
-}));
-rejoinBtn.addEventListener("click", withLobbyError(async () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc)));
+});
+createForm.addEventListener("submit", (e) => { e.preventDefault(); createRoom(); });
+rejoinBtn.addEventListener("click", busyButton(rejoinBtn, "接続中…", async () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc)));
 
 // Joining needs its own Turnstile token too (spec: check on create and join)
 async function enterRoom(id, adhoc = false) {
