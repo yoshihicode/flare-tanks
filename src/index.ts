@@ -199,6 +199,7 @@ export class Room extends DurableObject<Env> {
   banned = new Set<string>(); // guest IDs kicked by the owner
   reportedPhase = "";
   msgCount = 0; // incoming messages not yet reported to the lobby
+  tickStats = { n: 0, sum: 0, max: 0 }; // tick processing time (ms), read with the dev-only {t:"dbg", stats:true}
   usageAt = 0; // when usage was last reported (s)
   emptySince = 0; // when the last human left
   pins: Record<Team, Pin[]> = { A: [], B: [] };
@@ -464,6 +465,11 @@ export class Room extends DurableObject<Env> {
     if (m.expireReserve === true) this.reserved.clear(); // pretend the reconnect window has passed
     if (m.closeWhenEmpty === true) this.debug.closeWhenEmpty = true; // skip the reconnect window when the last human leaves
     if (m.reportUsage === true) this.reportUsage(now); // send the message count now instead of within a minute
+    if (m.stats === true) { // tick timing since the last read, then reset
+      const { n, sum, max } = this.tickStats;
+      c.ws.send(JSON.stringify({ t: "stats", ticks: n, avgMs: n ? sum / n : 0, maxMs: max }));
+      this.tickStats = { n: 0, sum: 0, max: 0 };
+    }
     if (Number.isFinite(m.phaseSec)) this.phaseEndsAt = now + m.phaseSec; // いまの段階の残り時間を変える
     if (m.killTeam === "A" || m.killTeam === "B") {
       for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; t.respawnAt = now + CONQUEST.respawnSec; }
@@ -677,6 +683,15 @@ export class Room extends DurableObject<Env> {
   }
 
   tick() {
+    const started = performance.now();
+    this.step();
+    const ms = performance.now() - started;
+    this.tickStats.n++;
+    this.tickStats.sum += ms;
+    this.tickStats.max = Math.max(this.tickStats.max, ms);
+  }
+
+  step() {
     const now = Date.now() / 1000;
     const dt = TICK_MS / 1000;
     // Movement uses the fixed step (same as client prediction), but capture progress and score use

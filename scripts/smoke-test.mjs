@@ -54,6 +54,7 @@ async function join(tank, roomName = room, extra = "", who = {}) {
       if (m.t === "init") { grid ??= makeGrid(m.map); c.init = m; c.settings = m.settings; }
       else if (m.t === "cfg") { c.settings = m.settings; c.points = m.points; if (m.map) c.map = m.map; }
       else if (m.t === "players") c.players = m.players;
+      else if (m.t === "stats") c.stats = m;
       else if (m.t === "s") {
         c.id = m.me; // 観戦中は null
         c.last = m;
@@ -351,6 +352,15 @@ const mapRoomDone = (async () => {
   mstep("シード値を空にすると、部屋が新しいシードを決めて設定に書き込む",
     Number.isInteger(p.settings.mapSeed) && p.settings.mapSeed !== 4242 && p.map.join("") === generateMap(p.settings.mapSeed).tiles.join(""),
     `seed=${p.settings.mapSeed}`);
+  // Server load on a 128x128 map with bots running (the waiting phase lets them move around)
+  debug(p, { stats: true }); // reset the counters
+  await sleep(3000);
+  p.stats = null;
+  debug(p, { stats: true });
+  await until(() => p.stats);
+  mstep("128×128で bot が動く部屋の1ティックの処理時間（平均 <10ms、最大 <50ms）",
+    p.stats && p.stats.ticks > 30 && p.stats.avgMs < 10 && p.stats.maxMs < 50,
+    p.stats ? `avg ${p.stats.avgMs.toFixed(2)}ms max ${p.stats.maxMs.toFixed(1)}ms / ${p.stats.ticks} ticks` : "no stats");
   p.ws.close();
   q.ws.close();
 })();

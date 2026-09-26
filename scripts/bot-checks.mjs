@@ -143,6 +143,15 @@ export function botChecks() {
     run(makeBot(3), self, { sec: 8, objectives, allies: [ally] });
     checks.push(["拠点制圧：味方がいる拠点は避けて分散する", inZone(self, objectives[1]), `pos=(${self.x | 0},${self.y | 0})`]);
   }
+  // Three members, three points: every bot computes the same assignment and they all go different ways
+  {
+    const objectives = [zone("A", 8, 4, "A"), zone("B", 22, 16, "B"), zone("C", 15, 10)];
+    const team = [tank("b1", "A", at(4, 8)), tank("b2", "A", at(4, 10)), tank("b3", "A", at(4, 12))];
+    const picks = team.map((self) => makeBot(3).pickObjective({
+      self, allies: team.filter((t) => t !== self), enemies: [], hit: null, now: 0, objectives,
+    })?.id);
+    checks.push(["拠点制圧：チーム内で拠点を分担する（3人で3拠点を1人ずつ）", new Set(picks).size === 3, picks.join(",")]);
+  }
   // Seeing an enemy still takes priority over walking to a point
   {
     const objectives = [zone("C", 20, 10)];

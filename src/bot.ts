@@ -63,9 +63,8 @@ const BOT = {
   repathSec: 1, // 追跡中に経路を引き直す間隔
   // Conquest: how a bot picks which capture point to go to (lower score = better; base score is distance in px)
   objectiveSec: 2, // re-pick the target point at this interval
-  ownedPenalty: 400, // our own uncontested point: only defended when nothing else needs us
+  ownedPenalty: 1200, // cost added to our own uncontested point, so members go there last (sized for 128x128 maps)
   contestedBonus: 250, // a contested point (or one being taken from us) pulls allies in
-  allyPenalty: 250, // per ally already in the zone, so bots spread over points
   holdRatio: 0.6, // stop moving once within this fraction of the zone radius
 };
 
@@ -137,7 +136,6 @@ export function findPath(g: Grid, from: Tile, to: Tile): Tile[] | null {
 export const toTile = (x: number, y: number): Tile => [Math.floor(x / TILE), Math.floor(y / TILE)];
 const center = (t: Tile) => ({ x: t[0] * TILE + TILE / 2, y: t[1] * TILE + TILE / 2 });
 const sameTile = (a: Tile, b: Tile) => a[0] === b[0] && a[1] === b[1];
-const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
 
 type State = "patrol" | "ambush" | "engage" | "chase" | "retreat" | "objective";
 interface Memory { id: string; x: number; y: number; vx: number; vy: number; seenAt: number }
@@ -273,23 +271,28 @@ export class Bot {
     const s = p.self;
     const current = list.find((o) => o.id === this.objective);
     if (current && p.now - this.objectiveAt < BOT.objectiveSec) return current;
-    const score = (o: Objective) => {
-      let v = Math.hypot(o.x - s.x, o.y - s.y);
-      if (o.contested) v -= BOT.contestedBonus;
-      else if (o.owner === s.team) v += BOT.ownedPenalty;
-      const alliesIn = p.allies.filter((a) => !a.dead && Math.hypot(a.x - o.x, a.y - o.y) <= o.r).length;
-      v += alliesIn * BOT.allyPenalty;
-      return v;
-    };
-    // When every point is ours and quiet, defend the one closest to the enemy base
-    const allOurs = list.every((o) => o.owner === s.team && !o.contested);
-    const best = allOurs
-      ? list.reduce((a, b) => (dist2(b, this.opts.enemyHome) < dist2(a, this.opts.enemyHome) ? b : a))
-      : list.reduce((a, b) => (score(b) < score(a) ? b : a));
+    // Team-wide greedy assignment: every (member, point) pair ordered by cost, each point taking at most
+    // its share of members. Every bot computes the same result from the same public information
+    // (ally positions and point states), so the team spreads out without talking
+    const members = [s, ...p.allies.filter((a) => !a.dead)].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const share = Math.max(1, Math.ceil(members.length / list.length));
+    const cost = (m: TankView, o: Objective) =>
+      Math.hypot(o.x - m.x, o.y - m.y) + (o.contested ? -BOT.contestedBonus : o.owner === s.team ? BOT.ownedPenalty : 0);
+    const pairs = members.flatMap((m) => list.map((o) => ({ m: m.id, o, c: cost(m, o) })))
+      .sort((a, b) => a.c - b.c || (a.m < b.m ? -1 : 1) || (a.o.id < b.o.id ? -1 : 1));
+    const taken = new Map<string, Objective>();
+    const load = new Map<string, number>();
+    for (const { m, o } of pairs) {
+      if (taken.has(m) || (load.get(o.id) ?? 0) >= share) continue;
+      taken.set(m, o);
+      load.set(o.id, (load.get(o.id) ?? 0) + 1);
+    }
+    const best = taken.get(s.id) ?? list[0];
     this.objective = best.id;
     this.objectiveAt = p.now;
     return best;
   }
+
 
   // 視界に入った敵から狙う相手を選び、記憶と共有情報を更新する
   observe(p: Perception): TankView | null {
