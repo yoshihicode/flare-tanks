@@ -63,7 +63,7 @@ await startNow(a);
 const t0 = Date.now();
 
 // ===== 別の部屋：bot の巡回と、切断した戦車の引き継ぎ =====
-const bots = { moved: 0, takenOver: false, alliesMax: 0, fires: 0 };
+const bots = { moved: 0, takenOver: false, alliesMax: 0, fires: 0, botPins: 0 };
 (async () => {
   const room2 = room + "-bots";
   const x = await join("medium", room2, "&bot=5"); // A。最初の人が bot の強さを決める
@@ -75,6 +75,7 @@ const bots = { moved: 0, takenOver: false, alliesMax: 0, fires: 0 };
     const team = m.tanks.filter((k) => k.team === "A");
     bots.alliesMax = Math.max(bots.alliesMax, team.length);
     bots.fires += m.ev.filter((e) => e.e === "fire").length; // x は撃たないので、味方 bot か見えた敵 bot の発射
+    bots.botPins += m.pins.filter((p) => p.by !== x.id).length; // pins from Lv5 ally bots
     for (const k of team) {
       if (!k.bot) continue;
       if (!start.has(k.id)) start.set(k.id, k);
@@ -251,6 +252,9 @@ send(b, { mx: 0, my: -1 });
 send(c, { mx: 0, my: 1 });
 setTimeout(() => send(c, { mx: 0, my: 0 }), 1500);
 setTimeout(() => send(a, { mx: 0, my: -1, aim: 3.14 }), 3500); // 180°振り向かせて旋回の上限を確かめる
+// Pins: three in quick succession -> only one is accepted (rate limit)
+setTimeout(() => { for (let i = 0; i < 3; i++) a.ws.send(JSON.stringify({ t: "pin", x: 100 + i * 10, y: 100 })); }, 1000);
+const pinIds = new Set();
 let bTurned = false, aPrev = null, cPrev = null;
 
 // サーバーの移動結果が共有の stepTank と一致するか（入力が一定の間だけ比べる）
@@ -268,6 +272,7 @@ a.onSnap = (m) => {
   st.teamA = Math.max(st.teamA || 0, m.tanks.filter((k) => k.team === me.team).length);
   const ally = m.tanks.find((k) => k.id === c.id);
   ally ? st.allyShown++ : st.allyMissing++;
+  for (const p of m.pins) if (p.by === a.id) pinIds.add(p.id);
   if (el < 400) for (const k of m.tanks) k.hp === tankSpec(k.k).hp ? st.hpOk++ : st.hpNg++;
   if (en) {
     if (el < 2000) st.earlyLeak++;
@@ -284,8 +289,10 @@ a.onSnap = (m) => {
   if (target) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(target.y - me.y, target.x - me.x) * 100) / 100, fire: true });
 };
 
+c.onSnap = (m) => { if (m.pins.some((p) => p.by === a.id)) st.allyGotPin = true; };
 b.onSnap = (m) => {
   snaps++;
+  if (m.pins.some((p) => !p.by.startsWith("B"))) st.pinLeak = true; // team B must never see team A's pins
   m.ev.forEach((x) => events.add(x.e));
   const me = m.tanks.find((k) => k.id === m.view); // 撃破後は味方の視点で絞り込まれる
   st.teamB = Math.max(st.teamB || 0, m.tanks.filter((k) => k.team === me.team).length);
@@ -323,6 +330,9 @@ setTimeout(async () => {
     ["離れている間は敵が送られない", st.earlyLeak === 0, `leak=${st.earlyLeak}`],
     ["送られた敵は視界内 ≥95%", ratioOk(st.enemyOk, st.enemyNg, 0.95), `ok=${st.enemyOk} ng=${st.enemyNg}`],
     ["送られた敵弾は視界内 ≥95%", ratioOk(st.bulletOk, st.bulletNg, 0.95), `ok=${st.bulletOk} ng=${st.bulletNg}`],
+    ["ピンは味方に届き、敵には届かない", pinIds.size > 0 && st.allyGotPin && !st.pinLeak, `ally=${!!st.allyGotPin} leak=${!!st.pinLeak}`],
+    ["ピンの連打は制限される（1秒に1本）", pinIds.size === 1, `accepted=${pinIds.size}`],
+    ["Lv5 の bot がピンで味方に知らせる", bots.botPins > 0, `botPins=${bots.botPins}`],
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
   for (const [name, ok, detail] of checks) console.log(`${ok ? "ok  " : "NG  "} ${name}（${detail}）`);

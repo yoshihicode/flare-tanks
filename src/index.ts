@@ -4,7 +4,7 @@ import {
   TILE, TICK_MS, TANK_TYPES, DEFAULT_TANK, tankSpec, makeGrid, isWall as isWallAt,
   stepTank, turnTurret, canSeePoint, canSeeTank,
 } from "../public/shared.js";
-import { Bot, type TeamIntel } from "./bot.ts";
+import { Bot, type Pin } from "./bot.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
 const TEAM_SIZE = 3; // 1チームの台数（3vs3）。空いた枠は bot が埋める
@@ -29,6 +29,11 @@ const CONQUEST = {
   radius: 40, // capture zone radius (px, 2.5 tiles)
   respawnSec: 5, // respawn at own base after this delay
 };
+// "Enemy spotted" pins shared within a team (humans with a key, Lv5 bots automatically)
+const PIN = {
+  lifeSec: 6, // a pin disappears after this
+  cooldownSec: 1, // one pin per tank per second at most; a new pin replaces the tank's previous one
+};
 type Mode = "elim" | "conquest";
 const MODE_DEFAULT: Mode = "elim";
 type Phase = "wait" | "countdown" | "play" | "roundEnd" | "matchEnd";
@@ -50,6 +55,7 @@ interface Tank {
   x: number; y: number; body: number; aim: number;
   hp: number; dead: boolean; cooldown: number;
   respawnAt: number; // conquest only: time (s) to respawn after being destroyed
+  pinAt: number; // when this tank last placed a pin
   input: Input;
   human: string | null; // 操作している接続のID
   bot: Bot | null;
@@ -151,7 +157,8 @@ export class Room extends DurableObject<Env> {
   points: CapturePoint[] = [];
   score: Record<Team, number> = { A: 0, B: 0 };
   lastTickAt = 0; // wall-clock time of the previous tick (s)
-  intel: Record<Team, { last: TeamIntel | null }> = { A: { last: null }, B: { last: null } }; // bot の発見情報（レベル5）
+  pins: Record<Team, Pin[]> = { A: [], B: [] };
+  nextPinId = 1;
   debug = { freezeBots: false };
   // 試合の進行
   phase: Phase = "wait";
@@ -199,12 +206,12 @@ export class Room extends DurableObject<Env> {
     this.newMatch(Date.now() / 1000);
     this.bullets = [];
     this.tanks = [];
-    this.intel = { A: { last: null }, B: { last: null } };
+    this.pins = { A: [], B: [] };
     for (const team of TEAMS) {
       for (let slot = 0; slot < TEAM_SIZE; slot++) {
         const t: Tank = {
           id: `${team}${slot}`, team, slot, type: BOT_TYPES[slot],
-          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0, respawnAt: 0,
+          x: 0, y: 0, body: 0, aim: 0, hp: 0, dead: false, cooldown: 0, respawnAt: 0, pinAt: -Infinity,
           input: { ...IDLE }, human: null, bot: null, hit: null,
         };
         t.bot = this.newBot(t);
@@ -217,7 +224,7 @@ export class Room extends DurableObject<Env> {
   newBot(t: Tank): Bot {
     const home = spawnPoint(t.team, 1);
     const enemyHome = spawnPoint(t.team === "A" ? "B" : "A", 1);
-    return new Bot(this.botLevel, GRID, { home, enemyHome, intel: this.intel[t.team], bulletSpeed: BULLET_SPEED });
+    return new Bot(this.botLevel, GRID, { home, enemyHome, bulletSpeed: BULLET_SPEED });
   }
 
   // 人間の少ないチームへ入れる（同数ならA）。両チームとも人間で埋まっていれば null（満員）
@@ -279,6 +286,10 @@ export class Room extends DurableObject<Env> {
       if (c === this.owner && this.phase === "wait") this.startRound(Date.now() / 1000);
       return;
     }
+    if (m?.t === "pin") {
+      if (c.tank && Number.isFinite(m.x) && Number.isFinite(m.y)) this.addPin(c.tank, m.x, m.y, Date.now() / 1000);
+      return;
+    }
     if (m?.t !== "in" || !c.tank) return;
     c.tank.input = {
       mx: dir(m.mx), my: dir(m.my),
@@ -330,7 +341,7 @@ export class Room extends DurableObject<Env> {
   // ラウンド開始：観戦中の人を座らせ、全車を自陣に戻してカウントダウン
   startRound(now: number) {
     for (const c of this.clients.values()) if (!c.tank) this.seat(c);
-    this.intel = { A: { last: null }, B: { last: null } };
+    this.pins = { A: [], B: [] };
     for (const t of this.tanks) {
       this.spawn(t);
       if (t.bot) t.bot = this.newBot(t); // 前のラウンドの記憶を持ち越さない
@@ -409,6 +420,18 @@ export class Room extends DurableObject<Env> {
     }
   }
 
+  // Place a pin for t's team (live tanks only, rate-limited, clamped to the map)
+  addPin(t: Tank, x: number, y: number, now: number) {
+    if (t.dead || now - t.pinAt < PIN.cooldownSec) return;
+    t.pinAt = now;
+    const list = this.pins[t.team].filter((p) => p.by !== t.id);
+    list.push({
+      id: this.nextPinId++, by: t.id, at: now,
+      x: Math.max(0, Math.min(MAP_W * TILE, x)), y: Math.max(0, Math.min(MAP_H * TILE, y)),
+    });
+    this.pins[t.team] = list;
+  }
+
   endRound(now: number, result: Result) {
     this.roundResult = result;
     if (result !== "draw") this.wins[result]++;
@@ -437,7 +460,8 @@ export class Room extends DurableObject<Env> {
       if (this.debug.freezeBots) { t.input = { ...IDLE, aim: t.aim }; continue; }
       const enemies = this.tanks.filter((e) => e.team !== t.team && !e.dead && canSeeTank(GRID, t, e));
       const allies = this.tanks.filter((a) => a.team === t.team && a !== t);
-      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now, objectives });
+      t.input = t.bot.think({ self: t, allies, enemies, hit: t.hit, now, objectives, pins: this.pins[t.team] });
+      if (t.input.pin) this.addPin(t, t.input.pin.x, t.input.pin.y, now);
     }
   }
 
@@ -449,6 +473,7 @@ export class Room extends DurableObject<Env> {
     const realDt = this.lastTickAt ? Math.min(0.25, Math.max(0, now - this.lastTickAt)) : dt;
     this.lastTickAt = now;
     this.updatePhase(now);
+    for (const team of TEAMS) this.pins[team] = this.pins[team].filter((p) => now - p.at < PIN.lifeSec);
     this.thinkBots(now);
 
     // 戦車の移動と射撃（人間も bot も同じ処理）。
@@ -547,6 +572,8 @@ export class Room extends DurableObject<Env> {
           id: t.id, team: t.team, k: t.type, x: r1(t.x), y: r1(t.y),
           b: r2(t.body), a: r2(t.aim), hp: t.hp, dead: t.dead, bot: t.bot ? 1 : 0,
         })),
+      // Own team's pins only (placed by allies, so no hidden information)
+      pins: this.pins[c.team].map((p) => ({ id: p.id, x: r1(p.x), y: r1(p.y), by: p.by, life: r1(PIN.lifeSec - (now - p.at)) })),
       bullets: this.bullets
         .filter((b) => b.team === v.team || seen(b.x, b.y))
         .map((b) => [Math.round(b.x), Math.round(b.y)]),

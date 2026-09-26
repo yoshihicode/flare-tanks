@@ -44,6 +44,7 @@ const fog = fogCv.getContext("2d");
 // ===== 状態 =====
 let ws = null, myId = null, map = [], grid = null;
 let points = []; // capture points {id, x, y, r} (conquest mode only; states come in each snapshot)
+const seenPins = new Set(); // pin ids already announced with a sound
 let prev = null, curr = null, currAt = 0;
 let audio = null;
 const keys = new Set();
@@ -124,6 +125,11 @@ function connect() {
       pred = null; history = []; sentAt.clear();
     } else if (m.t === "s") {
       if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
+      for (const pin of m.pins) {
+        if (seenPins.has(pin.id)) continue;
+        seenPins.add(pin.id);
+        if (audio && curr) tone(1200, 1500, 0.08, "square", 0.5); // new pin from the team (skip on first snapshot)
+      }
       prev = curr; curr = m; currAt = performance.now();
       myId = m.me; // 自分が操作している戦車（bot の枠を引き継ぐので接続IDとは別。観戦中は null）
       reconcile(m);
@@ -148,6 +154,10 @@ addEventListener("keydown", (e) => {
     ws?.send(JSON.stringify({ t: "start" }));
   }
   if (e.code === "Space") { mouse.down = true; e.preventDefault(); }
+  // Q: "enemy spotted" pin at the mouse position, shared with the team
+  if (e.code === "KeyQ" && !e.repeat && ws?.readyState === WebSocket.OPEN && curr?.me) {
+    ws.send(JSON.stringify({ t: "pin", x: Math.round(mouse.x + cam.x), y: Math.round(mouse.y + cam.y) }));
+  }
 });
 addEventListener("keyup", (e) => {
   if (KEYMAP[e.code]) keys.delete(KEYMAP[e.code]);
@@ -361,6 +371,28 @@ function drawPoints() {
   }
 }
 
+// Team pins: a blinking marker in the world, or an arrow on the screen edge when off-screen
+function drawPins() {
+  const blink = Math.floor(performance.now() / 200) % 2;
+  for (const pin of curr.pins) {
+    ctx.globalAlpha = pin.life < 1 ? Math.max(0.2, pin.life) : 1; // fade out in the last second
+    ctx.fillStyle = blink ? PALETTE.flare : "#fff3c4";
+    const x = Math.round(pin.x - cam.x), y = Math.round(pin.y - cam.y);
+    if (x >= 4 && x <= W - 4 && y >= 16 && y <= H - 4) {
+      // Downward triangle above the spot, with a dot on the spot itself
+      ctx.beginPath(); ctx.moveTo(x - 4, y - 9); ctx.lineTo(x + 4, y - 9); ctx.lineTo(x, y - 3); ctx.closePath(); ctx.fill();
+      ctx.fillRect(x - 1, y - 1, 2, 2);
+    } else {
+      const ex = clamp(x, 6, W - 6), ey = clamp(y, 18, H - 6);
+      const a = Math.atan2(y - ey, x - ex);
+      ctx.save(); ctx.translate(ex, ey); ctx.rotate(a);
+      ctx.beginPath(); ctx.moveTo(5, 0); ctx.lineTo(-3, -4); ctx.lineTo(-3, 4); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
 // Point letters are text, so they go on the high-resolution HUD layer
 function drawPointLabels() {
   hud.font = "8px DotGothic16, monospace";
@@ -481,6 +513,7 @@ function frame() {
   for (const [bx, by] of curr.bullets) ctx.fillRect(Math.round(bx - cam.x) - 1, Math.round(by - cam.y) - 1, 2, 2);
   drawPoints();
   for (const k of tanks) if (!k.dead) drawTank(k, k.id === myId);
+  drawPins();
   drawPointLabels();
   drawHud(me);
   requestAnimationFrame(frame);

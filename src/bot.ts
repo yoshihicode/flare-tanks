@@ -1,6 +1,6 @@
 // bot の思考。部屋DO（src/index.ts）から毎ティック呼ばれ、人間と同じ形式の入力を返す。
 // 受け取る情報は「自分の状態・味方の状態・自分の視界に入っている敵・自分が撃たれた方向」だけにして、
-// どのレベルでも壁越しに敵を知ることがないようにする（レベル5の味方 bot との共有も、誰かが見た情報だけ）。
+// どのレベルでも壁越しに敵を知ることがないようにする（レベル5の連携も、味方が立てたピン＝誰かが見た情報だけ）。
 // Room に依存しないので、Node から直接読み込んでテストできる（スモークテストの前半）
 import { TILE, isWallTile, angleDiff, lineOfSight, tankSpec } from "../public/shared.js";
 
@@ -8,7 +8,10 @@ export interface TankView {
   id: string; team: string; type: string;
   x: number; y: number; aim: number; hp: number; dead: boolean;
 }
-export interface BotInput { mx: number; my: number; aim: number; fire: boolean }
+// pin: place an "enemy spotted" marker for the team (same input format as humans)
+export interface BotInput { mx: number; my: number; aim: number; fire: boolean; pin?: { x: number; y: number } }
+// An ally's "enemy spotted" marker (placed by a human or a bot on the same team)
+export interface Pin { id: number; x: number; y: number; at: number; by: string }
 export interface Perception {
   self: TankView;
   allies: TankView[]; // 味方は人間と同じく常に位置がわかる
@@ -16,14 +19,12 @@ export interface Perception {
   hit: { dir: number; at: number } | null; // 最後に撃たれた方向（弾が飛んできた向き）と時刻
   now: number; // 秒
   objectives?: Objective[]; // conquest mode only: capture point states (public info, no enemy positions)
+  pins?: Pin[]; // active pins of our own team
 }
 export interface Objective { id: string; x: number; y: number; r: number; owner: string | null; contested: boolean }
-// 同じチームの bot で共有する発見情報（レベル5だけが読み書きする）
-export interface TeamIntel { x: number; y: number; at: number }
 export interface BotOptions {
   home: { x: number; y: number }; // 自陣（退避先）
   enemyHome: { x: number; y: number }; // 敵陣（巡回の目安。点対称マップなので誰でも知っている）
-  intel: { last: TeamIntel | null }; // チームで共有する入れ物
   bulletSpeed: number;
 }
 interface Grid { map: string[]; w: number; h: number }
@@ -51,6 +52,7 @@ const BOT = {
   strafeSec: 1.5, // 交戦中に横移動の向きを変える間隔
   memorySec: 6, // 見失った敵の位置を覚えている時間
   intelSec: 4, // 共有された発見情報を信じる時間
+  pinSec: 2, // Lv5: minimum interval between pins while tracking an enemy
   hitMemorySec: 2, // 撃たれた方向へ振り向き続ける時間
   lostResetSec: 1, // これ以上見失ったら、再発見時に反応時間をやり直す
   ambushChance: 0.35, // 巡回の目的地に着いたとき待ち伏せする確率
@@ -128,6 +130,9 @@ export class Bot {
   ambushUntil = 0;
   flank: { src: object; x: number; y: number } | null = null; // 回り込み先（発見情報ごとに一度だけ決める）
   objective: string | null = null; // id of the capture point this bot is heading to / holding
+  pinAt = -Infinity; // when this bot last asked to place a pin
+  pinRequest: { x: number; y: number } | null = null;
+  donePins = new Set<number>(); // pins already checked out (arrived, nothing there)
   objectiveAt = -Infinity;
 
   constructor(level: number, grid: Grid, opts: BotOptions, rand: () => number = Math.random) {
@@ -221,7 +226,9 @@ export class Bot {
         break;
       }
     }
-    return { ...move, aim, fire };
+    const pin = this.pinRequest ?? undefined;
+    this.pinRequest = null;
+    return { ...move, aim, fire, pin };
   }
 
   // Conquest: choose the capture point to go to. Re-picked every few seconds so bots don't flip-flop.
@@ -267,7 +274,11 @@ export class Bot {
       vx: dt > 0 ? (t.x - m!.x) / dt : 0, vy: dt > 0 ? (t.y - m!.y) / dt : 0,
       seenAt: p.now,
     };
-    if (this.cfg.share) this.opts.intel.last = { x: t.x, y: t.y, at: p.now };
+    // Lv5: tell the team with a pin (humans see it too)
+    if (this.cfg.share && p.now - this.pinAt >= BOT.pinSec) {
+      this.pinRequest = { x: t.x, y: t.y };
+      this.pinAt = p.now;
+    }
     return t;
   }
 
@@ -299,17 +310,25 @@ export class Bot {
     return { mx: Math.abs(vx) > 0.38 ? Math.sign(vx) : 0, my: Math.abs(vy) > 0.38 ? Math.sign(vy) : 0 };
   }
 
-  // 追跡先：自分の記憶 → （レベル5）味方 bot の発見情報。レベル4以上は横から回り込む
+  // Newest recent pin placed by someone else on the team (Lv5 only)
+  allyPin(p: Perception): Pin | null {
+    if (!this.cfg.share || !p.pins) return null;
+    const fresh = p.pins.filter((q) => q.by !== p.self.id && p.now - q.at < BOT.intelSec && !this.donePins.has(q.id));
+    return fresh.length ? fresh.reduce((a, b) => (b.at > a.at ? b : a)) : null;
+  }
+
+  // 追跡先：自分の記憶 → （レベル5）味方のピン。レベル4以上は横から回り込む
   chaseGoal(p: Perception): { x: number; y: number } | null {
     let g: { x: number; y: number } | null = null;
+    const pin = this.allyPin(p);
     if (this.memory && p.now - this.memory.seenAt < BOT.memorySec) g = this.memory;
-    else if (this.cfg.share && this.opts.intel.last && p.now - this.opts.intel.last.at < BOT.intelSec) g = this.opts.intel.last;
+    else if (pin) g = pin;
     if (!g) return null;
     const s = p.self;
     // 見失った場所に着いても何もいなければ、その情報は捨てて巡回に戻る
     if (Math.hypot(g.x - s.x, g.y - s.y) < TILE) {
       if (g === this.memory) this.memory = null;
-      else this.opts.intel.last = null;
+      else if (pin) this.donePins.add(pin.id);
       return null;
     }
     if (!this.cfg.flank) return g;

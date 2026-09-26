@@ -9,19 +9,19 @@ const grid = makeGrid(Array.from({ length: H }, (_, y) =>
   Array.from({ length: W }, (_, x) => (x === 0 || y === 0 || x === W - 1 || y === H - 1 ? "#" : ".")).join("")));
 const at = (tx, ty) => ({ x: tx * 16 + 8, y: ty * 16 + 8 });
 
-function makeBot(level, intel = { last: null }) {
-  return new Bot(level, grid, { home: at(2, 10), enemyHome: at(27, 10), intel, bulletSpeed: 180 });
+function makeBot(level) {
+  return new Bot(level, grid, { home: at(2, 10), enemyHome: at(27, 10), bulletSpeed: 180 });
 }
 function tank(id, team, pos, extra = {}) {
   return { id, team, type: "medium", ...pos, body: 0, aim: 0, hp: 100, dead: false, ...extra };
 }
 
 // サーバーと同じ手順で bot を動かす。see(now) は、その時点で bot の視界に入っている敵
-function run(bot, self, { sec, see = () => [], hit = null, onTick = () => {}, allies = [], objectives }) {
+function run(bot, self, { sec, see = () => [], hit = null, onTick = () => {}, allies = [], objectives, pins }) {
   let firstFire = null;
   for (let i = 0; i < sec / DT; i++) {
     const now = i * DT;
-    const input = bot.think({ self, allies, enemies: see(now), hit, now, objectives });
+    const input = bot.think({ self, allies, enemies: see(now), hit, now, objectives, pins });
     stepTank(grid, self, input.mx, input.my, DT);
     self.aim = turnTurret(self.type, self.aim, input.aim, DT);
     if (input.fire && firstFire === null) firstFire = now;
@@ -87,21 +87,26 @@ export function botChecks() {
     checks.push(["bot は見失った敵を追う", closer > 100, `近づいた距離=${closer.toFixed(0)}px`]);
   }
 
-  // 連携：Lv5 は味方 bot が見た敵の場所の近く（回り込み先を含む）を目的地にして追う。Lv3 は共有しない
+  // 連携：Lv5 は敵を見つけるとピンを立て、味方のピンの近く（回り込み先を含む）を目的地にして追う。Lv3 はどちらもしない
   const shared = (level) => {
-    const intel = { last: null };
-    const spotter = makeBot(level, intel);
     const enemy = tank("e", "B", at(4, 17));
-    spotter.think({ self: tank("s", "A", at(8, 17)), allies: [], enemies: [enemy], hit: null, now: 0 });
-    const bot = makeBot(level, intel);
-    run(bot, tank("b", "A", at(14, 3)), { sec: 1 });
+    const input = makeBot(level).think({ self: tank("s", "A", at(8, 17)), allies: [], enemies: [enemy], hit: null, now: 0 });
+    const pins = input.pin ? [{ id: 1, ...input.pin, at: 0, by: "s" }] : [];
+    const bot = makeBot(level);
+    run(bot, tank("b", "A", at(14, 3)), { sec: 1, pins });
     const goalDist = bot.goal ? Math.hypot(bot.goal[0] - 4, bot.goal[1] - 17) : Infinity;
-    return { state: bot.state, goalDist };
+    return { pinned: !!input.pin, state: bot.state, goalDist };
   };
   const s5 = shared(5), s3 = shared(3);
-  checks.push(["Lv5 は味方 bot の発見情報で追う（Lv3 は共有しない）",
-    s5.state === "chase" && s5.goalDist <= 5 && s3.state !== "chase",
-    `Lv5=${s5.state}(目的地まで${s5.goalDist.toFixed(1)}タイル) Lv3=${s3.state}`]);
+  checks.push(["Lv5 は敵発見でピンを立て、味方のピンで追う（Lv3 はしない）",
+    s5.pinned && s5.state === "chase" && s5.goalDist <= 5 && !s3.pinned && s3.state !== "chase",
+    `Lv5=pin:${s5.pinned} ${s5.state}(目的地まで${s5.goalDist.toFixed(1)}タイル) Lv3=pin:${s3.pinned} ${s3.state}`]);
+  // A Lv5 bot also follows a pin placed by a human teammate
+  {
+    const bot = makeBot(5);
+    run(bot, tank("b", "A", at(14, 3)), { sec: 1, pins: [{ id: 7, ...at(4, 17), at: 0, by: "human" }] });
+    checks.push(["Lv5 は人間の味方が立てたピンも追う", bot.state === "chase", `state=${bot.state}`]);
+  }
 
   // 撃たれた方向を向く（見えない相手からの被弾）
   {
