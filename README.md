@@ -12,6 +12,8 @@
 
 FLARE TANKS is a top-down 2D pixel-art tank game. Two teams of three fight on a point-symmetric map with fan-shaped vision: what's behind walls stays dark, and the server never tells you where unseen enemies are. Empty slots are filled with bots, so you can play alone or with friends, on a PC or a phone.
 
+👉 **Live demo:** https://flare-tanks.yoshihicode.workers.dev/
+
 ## 🎯 About this project
 
 This project is a **sample of building a real-time multiplayer game with Cloudflare Durable Objects**. Rather than a minimal chat demo, it covers what an actual game server needs:
@@ -263,7 +265,7 @@ npm run deploy
 
 For local development none of this is needed: `npm run dev` uses Cloudflare's always-pass test keys.
 
-The game will be available at `https://flare-tanks.<your-subdomain>.workers.dev`. The Durable Object classes are created from the `migrations` in `wrangler.jsonc` (`new_sqlite_classes`, required on the free plan).
+The game will be available at `https://flare-tanks.yoshihicode.workers.dev`. The Durable Object classes are created from the `migrations` in `wrangler.jsonc` (`new_sqlite_classes`, required on the free plan).
 
 Watch the logs with:
 
