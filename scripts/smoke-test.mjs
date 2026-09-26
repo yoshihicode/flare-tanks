@@ -12,6 +12,8 @@ import { sample, pushSnapshot, INTERP } from "../public/interp.js";
 import { minimapLayout, minimapDots, MINIMAP } from "../public/minimap.js";
 import { readFileSync } from "node:fs";
 import { SFX, FIRE_SFX, synth } from "../public/sfx.js";
+import { generateMap, assemble, validate, disjointPaths, GEN } from "../src/mapgen.ts";
+import { RANDOM_CHUNKS, BASE_CHUNK, POINT_CHUNK, PLAZA_CHUNK, CHUNK, transform } from "../src/chunks.ts";
 import vm from "node:vm";
 import { signToken, verifyToken, checkName, uniqueName, newGuestId } from "../src/guest.ts";
 import { LOBBY, pickQuick, expired, newCode, rateLimited, overBudget, publicList } from "../src/lobby.ts";
@@ -636,6 +638,63 @@ const sfxChecks = (() => {
   ];
 })();
 
+// Generated maps (src/mapgen.ts, src/chunks.ts), checked without the server.
+// Run at the end: generating 25 maps blocks the event loop, which would disturb the timed online checks
+const mapChecks = () => {
+  // Every part: 16x16, open outer ring, no sealed pockets, in every rotation / mirror
+  const parts = { ...RANDOM_CHUNKS, base: BASE_CHUNK, point: POINT_CHUNK, plaza: PLAZA_CHUNK };
+  const badParts = [];
+  for (const [name, rows] of Object.entries(parts)) {
+    for (let r = 0; r < 4; r++) {
+      for (const flip of [false, true]) {
+        const g = transform(rows, r, flip);
+        const floor = (x, y) => g[y]?.[x] !== undefined && g[y][x] !== "#";
+        const ring = [...Array(CHUNK).keys()].every((i) => floor(i, 0) && floor(i, CHUNK - 1) && floor(0, i) && floor(CHUNK - 1, i));
+        const total = g.join("").replace(/#/g, "").length;
+        const seen = new Set(["0,0"]);
+        const q = [[0, 0]];
+        while (q.length) {
+          const [x, y] = q.pop();
+          for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const k = `${x + dx},${y + dy}`;
+            if (floor(x + dx, y + dy) && !seen.has(k)) { seen.add(k); q.push([x + dx, y + dy]); }
+          }
+        }
+        if (g.length !== CHUNK || g.some((row) => row.length !== CHUNK) || !ring || seen.size !== total) badParts.push(`${name}/${r}${flip ? "f" : ""}`);
+      }
+    }
+  }
+  // Max flow on tiny maps: an open room vs. a one-tile choke point
+  const mk = (rows) => ({ tiles: rows, w: rows[0].length, h: rows.length });
+  const room = mk(["#######", "#.....#", "#.....#", "#.....#", "#.....#", "#.....#", "#######"]);
+  const choke = mk(["#######", "#.....#", "#.....#", "###.###", "#.....#", "#.....#", "#######"]);
+  const flowOk = disjointPaths(room, [3, 1], [3, 5], 5) === 3 && disjointPaths(room, [1, 1], [5, 5], 5) === 2
+    && disjointPaths(choke, [3, 1], [3, 5], 5) === 1;
+  // Many seeds: valid, point-symmetric, reproducible, and quick
+  const seeds = Array.from({ length: 25 }, (_, i) => 1000 + i * 7919);
+  const bad = [];
+  const t = performance.now();
+  const maps = seeds.map((seed) => generateMap(seed));
+  const ms = (performance.now() - t) / seeds.length;
+  for (const m of maps) {
+    const fails = validate(m);
+    const sym = m.tiles.every((row, y) => [...row].every((c, x) => c === m.tiles[m.h - 1 - y][m.w - 1 - x]));
+    const spawnSym = m.spawns.A.every((s, i) => s.x + m.spawns.B[i].x === m.w * TILE && s.y + m.spawns.B[i].y === m.h * TILE);
+    if (m.w !== 128 || m.h !== 128 || fails.length || !sym || !spawnSym) bad.push(`${m.seed}:${fails.join("/")}${sym ? "" : " asym"}`);
+  }
+  const again = generateMap(seeds[3]);
+  const distinct = new Set(maps.map((m) => m.tiles.join(""))).size;
+  return [
+    ["マップ部品：16×16で外周は床、閉じた空間なし（全部品・全向き）", badParts.length === 0, badParts.join(" ")],
+    ["マップ生成：最大流で経路数を数える（開けた部屋3本・狭い通路1本）", flowOk, ""],
+    ["マップ生成：128×128で点対称、全体がつながり、拠点間に3本以上の経路、遮蔽物は適度（25シード）",
+      bad.length === 0, bad.slice(0, 3).join(" ")],
+    ["マップ生成：同じシードは同じマップ、シードが違えば別のマップ",
+      again.tiles.join("") === maps[3].tiles.join("") && distinct === maps.length, `distinct=${distinct}/${maps.length}`],
+    ["マップ生成：1枚あたりの生成時間 <200ms", ms < 200, `${ms.toFixed(0)}ms/枚`],
+  ];
+};
+
 // ===== PWA: manifest, icons and service worker as served by the dev server =====
 const pwaChecks = [];
 const pwaDone = (async () => {
@@ -827,6 +886,7 @@ b.onSnap = (m) => {
     ...clientChecks,
     ...pwaChecks,
     ...sfxChecks,
+    ...mapChecks(),
     ["見えた発射には撃った車種が付く（発射音の切り替え用）", st.fireOk > 0 && !st.fireKindNg, `ng=${st.fireKindNg ?? 0}`],
     ["送られた敵の発射は視界内", st.fireNg === 0, `ok=${st.fireOk} ng=${st.fireNg}`],
   ];
