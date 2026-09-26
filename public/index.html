@@ -58,9 +58,40 @@
       font-size: 0.9rem; line-height: 2; min-width: 14rem;
     }
     #settings h2 { margin: 0 0 0.2rem; font-size: 1rem; font-weight: 400; color: var(--flare); }
-    #settings label { display: flex; justify-content: space-between; gap: 1rem; }
     #settings select, #settings input { font: inherit; color: var(--ash); background: #1b2419; border: 1px solid #4a483e; }
     #settings select:focus-visible, #settings input:focus-visible { outline: 2px solid var(--flare); }
+    /* Buttons and inputs in the title / lobby screens */
+    .btn, #lobby input {
+      font: inherit; color: var(--ash); background: rgba(0, 0, 0, 0.35); border: 2px solid #4a483e;
+      padding: 0.35rem 0.8rem; cursor: pointer;
+    }
+    .btn.primary { border-color: var(--flare); color: var(--flare); }
+    .btn:hover { background: rgba(255, 179, 71, 0.12); }
+    .btn:focus-visible, #lobby input:focus-visible { outline: 2px solid var(--flare); outline-offset: 2px; }
+    #lobby { display: flex; flex-direction: column; gap: 0.9rem; width: min(40rem, 100%); cursor: default; }
+    #lobby[hidden], #title[hidden], #createForm[hidden] { display: none; }
+    #lobby .row { display: flex; gap: 0.6rem; flex-wrap: wrap; justify-content: center; align-items: center; }
+    #lobby input { cursor: text; width: 7em; text-align: center; letter-spacing: 0.15em; }
+    #lobbyMsg { color: var(--flare); min-height: 1.2em; }
+    #rooms { list-style: none; margin: 0; padding: 0; max-height: 40vh; overflow-y: auto; text-align: left; border-top: 2px solid #4a483e; }
+    #rooms li { display: flex; justify-content: space-between; align-items: center; gap: 0.8rem; padding: 0.45rem 0.3rem; border-bottom: 1px solid #2c3328; }
+    #rooms .meta { font-size: 0.85rem; opacity: 0.8; }
+    #rooms .empty { justify-content: center; opacity: 0.7; }
+    #createForm, #settings { line-height: 2; }
+    #createForm { border: 2px solid #4a483e; padding: 0.6rem 1rem; text-align: left; }
+    #createForm label, #settings label { display: flex; justify-content: space-between; gap: 1rem; }
+    #createForm select { font: inherit; color: var(--ash); background: #1b2419; border: 1px solid #4a483e; }
+    #title { display: flex; flex-direction: column; align-items: center; gap: 1.25rem; }
+    /* Players panel (Tab): invite code and kick */
+    #players {
+      position: absolute; top: 3.2rem; left: 1rem; display: none;
+      background: rgba(10, 14, 11, 0.92); border: 2px solid #4a483e; padding: 0.6rem 0.8rem;
+      font-size: 0.9rem; line-height: 1.9; min-width: 16rem;
+    }
+    #players h2 { margin: 0 0 0.3rem; font-size: 1rem; font-weight: 400; color: var(--flare); }
+    #players ul { list-style: none; margin: 0.3rem 0; padding: 0; }
+    #players li { display: flex; justify-content: space-between; gap: 1rem; }
+    #players .A { color: #5ad1c8; } #players .B { color: #e8506a; }
     @media (prefers-reduced-motion: no-preference) {
       #overlay h1 { animation: flicker 3s infinite; }
       @keyframes flicker { 0%, 92%, 100% { opacity: 1 } 94% { opacity: 0.7 } 96% { opacity: 1 } 98% { opacity: 0.8 } }
@@ -70,13 +101,42 @@
 <body>
   <canvas id="c" width="320" height="180"></canvas>
   <canvas id="hud" aria-hidden="true"></canvas>
-  <div id="overlay" role="button" tabindex="0">
+  <div id="overlay">
     <h1>FLARE TANKS</h1>
-    <label id="who">名前 <input id="name" maxlength="12" autocomplete="nickname" placeholder="12文字まで"></label>
-    <div id="tanks" role="group" aria-label="戦車の選択"></div>
-    <div id="err" role="alert"></div>
-    <div id="msg">戦車を選んで出撃（1・2・3キーでも選べます）</div>
-    <div id="help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン（敵発見を味方に知らせる）</div>
+    <section id="title">
+      <label id="who">名前 <input id="name" maxlength="12" autocomplete="nickname" placeholder="12文字まで"></label>
+      <div id="tanks" role="group" aria-label="戦車の選択"></div>
+      <div id="err" role="alert"></div>
+      <div id="msg">戦車を選んでロビーへ（1・2・3キーで選択、Enter で決定）</div>
+      <div id="help">WASD／矢印キーで移動　マウスで照準　クリック／スペースで射撃　Q でピン　Tab で参加者一覧　Esc で部屋を出る</div>
+    </section>
+    <section id="lobby" hidden aria-label="ロビー">
+      <div id="lobbyMsg" role="status"></div>
+      <div class="row">
+        <button class="btn primary" id="quick" type="button">クイック参加</button>
+        <button class="btn" id="create" type="button">部屋を作る</button>
+        <form id="codeForm" class="row">
+          <input id="code" inputmode="numeric" pattern="\d{6}" maxlength="6" placeholder="招待コード" aria-label="招待コード（6桁）">
+          <button class="btn" type="submit">コードで参加</button>
+        </form>
+        <button class="btn" id="rejoin" type="button" hidden>さっきの部屋に戻る</button>
+      </div>
+      <form id="createForm" hidden aria-label="部屋を作る">
+        <label>モード <select name="mode"><option value="elim">殲滅</option><option value="conquest">拠点制圧</option></select></label>
+        <label>先取ラウンド（殲滅） <select name="winRounds"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>
+        <label>bot の強さ <select name="botLevel"><option value="1">1 入門</option><option value="2">2 初級</option><option value="3" selected>3 標準</option><option value="4">4 上級</option><option value="5">5 達人</option></select></label>
+        <label>フレンドリーファイア <input type="checkbox" name="ff"></label>
+        <label>公開（一覧に表示する） <input type="checkbox" name="public" checked></label>
+        <div class="row"><button class="btn primary" type="submit">作って入る</button><button class="btn" type="button" id="cancelCreate">やめる</button></div>
+      </form>
+      <ul id="rooms" aria-label="公開部屋の一覧"></ul>
+      <div class="row"><button class="btn" id="back" type="button">名前・戦車を変える</button></div>
+    </section>
+  </div>
+  <div id="players" aria-label="参加者一覧">
+    <h2>参加者</h2>
+    <div id="invite"></div>
+    <ul id="playerList"></ul>
   </div>
   <form id="settings" aria-label="部屋の設定">
     <h2>部屋の設定（部屋主のみ・待機中）</h2>

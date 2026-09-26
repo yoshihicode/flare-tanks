@@ -82,7 +82,7 @@ for (const type of TANK_ORDER) {
   btn.type = "button";
   btn.dataset.type = type;
   btn.innerHTML = `<b>${s.name}</b><small>${s.role}<br>HP ${s.hp}・ダメージ ${s.damage}<br>視野角 ${Math.round((s.fov * 180) / Math.PI)}°</small>`;
-  btn.addEventListener("click", (e) => { e.stopPropagation(); chooseTank(type); start(); });
+  btn.addEventListener("click", () => { chooseTank(type); goLobby(); });
   tankButtons.append(btn);
 }
 function chooseTank(type) {
@@ -93,7 +93,6 @@ function chooseTank(type) {
 chooseTank(tankType);
 
 // ===== 開始・接続 =====
-overlay.addEventListener("click", start);
 // ===== Guest name and signed token (saved in the browser) =====
 const nameInput = document.getElementById("name");
 const errBox = document.getElementById("err");
@@ -103,7 +102,6 @@ const store = {
 };
 let guest = { token: store.get("ft.token"), name: store.get("ft.name") || "" };
 nameInput.value = guest.name;
-nameInput.addEventListener("click", (e) => e.stopPropagation()); // typing must not start the game
 
 // Ask the server to check the name and sign (or renew) our token
 async function signIn() {
@@ -118,21 +116,51 @@ async function signIn() {
   store.set("ft.name", guest.name);
 }
 
+// Room actions go through the Worker with our token. Returns the JSON body or throws with its error text
+async function api(path, body = {}) {
+  const res = await fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: guest.token, ...body }),
+  });
+  const data = await res.json().catch(() => ({ error: "サーバーに接続できません" }));
+  if (!res.ok) throw new Error(data.error || "サーバーに接続できません");
+  return data;
+}
+
 addEventListener("keydown", (e) => {
-  if (overlay.style.display === "none") return;
-  if (e.key === "Enter") return start();
+  if (overlay.style.display === "none" || titleView.hidden) return;
+  if (e.key === "Enter") return goLobby();
   if (e.target === nameInput) return; // 1/2/3 while typing the name are just characters
   const i = ["Digit1", "Digit2", "Digit3"].indexOf(e.code);
   if (i >= 0) chooseTank(TANK_ORDER[i]);
 });
 
-let starting = false;
-async function start() {
-  if (starting) return;
+// ===== Screens: title (name + tank) -> lobby (room list) -> game =====
+const titleView = document.getElementById("title");
+const lobbyView = document.getElementById("lobby");
+const lobbyMsg = document.getElementById("lobbyMsg");
+const roomList = document.getElementById("rooms");
+const createForm = document.getElementById("createForm");
+const rejoinBtn = document.getElementById("rejoin");
+let lobbyWs = null;
+let lastRoom = null; // {id, adhoc} of the room we were in, to go back within the reconnect window
+
+function showScreen(name, text = "") {
+  overlay.style.display = name === "game" ? "none" : "flex";
+  titleView.hidden = name !== "title";
+  lobbyView.hidden = name !== "lobby";
+  if (name === "lobby") { lobbyMsg.textContent = text; openLobby(); } else closeLobby();
+  if (name === "title") msg.textContent = text || msg.textContent;
+  rejoinBtn.hidden = !lastRoom;
+}
+
+let busy = false;
+async function goLobby() {
+  if (busy) return;
   // iOS対策：ユーザー操作の中で音を有効化する
   if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
   audio.resume();
-  starting = true;
+  busy = true;
   errBox.textContent = "";
   try {
     await signIn();
@@ -141,35 +169,125 @@ async function start() {
     nameInput.focus();
     return;
   } finally {
-    starting = false;
+    busy = false;
   }
-  overlay.style.display = "none";
-  connect();
-}
-
-function showOverlay(text) {
-  msg.textContent = text;
-  overlay.style.display = "flex";
-}
-
-function connect() {
+  // Links straight into a room: ?code=123456 (invite) or ?room=name (dev-only ad-hoc room)
   const params = new URLSearchParams(location.search);
-  const room = params.get("room") || "default";
+  if (params.has("room")) return enterRoom(params.get("room"), true);
+  if (params.has("code")) {
+    const code = params.get("code");
+    window.history.replaceState(null, "", location.pathname); // don't auto-join again after leaving (a local "history" shadows it)
+    return joinByCode(code);
+  }
+  showScreen("lobby");
+}
+
+// Live room list over a WebSocket (the lobby pushes changes; no polling)
+function openLobby() {
+  if (lobbyWs) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  // Room settings (?mode=, ?bot=) are passed through; the server uses them only from the first player
-  const q = new URLSearchParams({ room, tank: tankType, token: guest.token, name: guest.name });
-  for (const key of ["mode", "bot"]) if (params.has(key)) q.set(key, params.get(key));
+  lobbyWs = new WebSocket(`${proto}://${location.host}/lobby?token=${encodeURIComponent(guest.token)}`);
+  lobbyWs.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.t === "rooms") renderRooms(m.rooms); };
+  lobbyWs.onclose = () => { lobbyWs = null; };
+}
+function closeLobby() {
+  lobbyWs?.close();
+  lobbyWs = null;
+}
+
+function renderRooms(rooms) {
+  roomList.replaceChildren();
+  if (!rooms.length) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "公開部屋はまだありません。クイック参加か「部屋を作る」で始めましょう";
+    roomList.append(li);
+    return;
+  }
+  for (const r of rooms) {
+    const li = document.createElement("li");
+    const info = document.createElement("div");
+    const rule = r.mode === "elim" ? `殲滅・${r.winRounds}ラウンド先取` : "拠点制圧";
+    info.innerHTML = `<div>${rule}</div><div class="meta">${r.humans}/${r.capacity}人・${r.playing ? "対戦中" : "待機中"}・bot Lv${r.botLevel}・FF${r.ff ? "あり" : "なし"}</div>`;
+    const btn = document.createElement("button");
+    btn.className = "btn";
+    btn.type = "button";
+    btn.textContent = r.humans >= r.capacity ? "満員" : "参加";
+    btn.disabled = r.humans >= r.capacity;
+    btn.addEventListener("click", () => enterRoom(r.id));
+    li.append(info, btn);
+    roomList.append(li);
+  }
+}
+
+const withLobbyError = (fn) => async (...args) => {
+  try { await fn(...args); } catch (e) { lobbyMsg.textContent = e.message; }
+};
+const joinByCode = withLobbyError(async (code) => {
+  if (!/^\d{6}$/.test(code)) throw new Error("招待コードは6桁の数字です");
+  const { id } = await api("/api/code", { code });
+  enterRoom(id);
+});
+document.getElementById("quick").addEventListener("click", withLobbyError(async () => enterRoom((await api("/api/quick")).id)));
+document.getElementById("create").addEventListener("click", () => { createForm.hidden = false; });
+document.getElementById("cancelCreate").addEventListener("click", () => { createForm.hidden = true; });
+document.getElementById("back").addEventListener("click", () => showScreen("title"));
+document.getElementById("codeForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  joinByCode(document.getElementById("code").value.trim());
+});
+createForm.addEventListener("submit", withLobbyError(async (e) => {
+  e.preventDefault();
+  const f = createForm.elements;
+  const settings = {
+    mode: f.mode.value, winRounds: Number(f.winRounds.value), botLevel: Number(f.botLevel.value),
+    ff: f.ff.checked, public: f.public.checked,
+  };
+  const { id } = await api("/api/rooms", { settings });
+  createForm.hidden = true;
+  enterRoom(id);
+}));
+rejoinBtn.addEventListener("click", () => lastRoom && enterRoom(lastRoom.id, lastRoom.adhoc));
+
+function enterRoom(id, adhoc = false) {
+  lastRoom = { id, adhoc };
+  showScreen("game");
+  connect(id, adhoc);
+}
+
+// Esc leaves the room and goes back to the lobby right away (without waiting for the close handshake)
+addEventListener("keydown", (e) => {
+  if (e.code !== "Escape" || !ws || overlay.style.display !== "none") return;
+  const sock = ws;
+  sock.onclose = null;
+  sock.close(1000);
+  roomClosed(1000, true);
+});
+
+function connect(roomId, adhoc) {
+  const params = new URLSearchParams(location.search);
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const q = new URLSearchParams({ room: roomId, tank: tankType, token: guest.token, name: guest.name });
+  // Dev-only ad-hoc rooms take their settings from the page URL (?mode=, ?bot=, ...)
+  if (adhoc) {
+    q.set("adhoc", "1");
+    for (const key of ["mode", "bot", "rounds", "ff"]) if (params.has(key)) q.set(key, params.get(key));
+  }
   ws = new WebSocket(`${proto}://${location.host}/ws?${q}`);
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.t === "init") {
       myId = null; map = m.map; grid = makeGrid(map); prev = curr = null;
+      pred = null; history = []; sentAt.clear();
       points = m.points || [];
       settings = m.settings;
+      inviteCode = m.code;
       ghosts.clear(); marks = [];
     } else if (m.t === "cfg") {
       settings = m.settings; points = m.points || [];
-      pred = null; history = []; sentAt.clear();
+    } else if (m.t === "players") {
+      players = m.players;
+      renderPlayers();
     } else if (m.t === "s") {
       if (curr && curr.g.ph !== m.g.ph) playPhase(m.g, m.team);
       const nowSec = performance.now() / 1000;
@@ -187,14 +305,73 @@ function connect() {
       m.ev.forEach(playEvent);
     }
   };
-  ws.onclose = (e) => {
-    ws = null;
-    // 4000: the same guest connected from another tab; 4003: room full
-    const why = e.code === 4000 ? "別の画面で接続したため、この画面は切断されました。"
-      : e.code === 4003 ? "部屋が満員です。" : "接続が切れました。";
-    showOverlay(`${why}クリックで再接続（30秒以内なら同じ戦車に戻れます）`);
-  };
+  ws.onclose = (e) => roomClosed(e.code, false);
 }
+
+// Back to the lobby with the reason. Close codes come from the server (see src/index.ts)
+function roomClosed(code, leftOnPurpose) {
+  ws = null;
+  curr = prev = null;
+  playersPanel.style.display = "none";
+  const why = {
+    1000: leftOnPurpose ? "部屋から出ました。" : "部屋が閉じられました。",
+    4000: "別の画面で接続したため、この画面は切断されました。",
+    4003: "部屋が満員です。",
+    4404: "部屋が見つかりません（閉じられた可能性があります）。",
+    4005: "この部屋からは追放されました。",
+  }[code] ?? "接続が切れました。30秒以内なら「さっきの部屋に戻る」で同じ戦車に戻れます。";
+  if ([4003, 4404, 4005].includes(code)) lastRoom = null;
+  showScreen("lobby", why);
+}
+
+// ===== Players panel (Tab): invite code / link, and kick for the owner =====
+const playersPanel = document.getElementById("players");
+let players = [];
+let inviteCode = null;
+function renderPlayers() {
+  const invite = document.getElementById("invite");
+  invite.replaceChildren();
+  if (inviteCode) {
+    const url = `${location.origin}${location.pathname}?code=${inviteCode}`;
+    invite.textContent = `招待コード ${inviteCode} `;
+    const copy = document.createElement("button");
+    copy.className = "btn";
+    copy.type = "button";
+    copy.textContent = "招待URLをコピー";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(url); copy.textContent = "コピーしました"; } catch { copy.textContent = url; }
+    });
+    invite.append(copy);
+  }
+  const list = document.getElementById("playerList");
+  list.replaceChildren();
+  const iAmOwner = !!curr?.g.owner;
+  for (const p of players) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = p.team;
+    name.textContent = `${p.name}${p.owner ? "（部屋主）" : ""}`;
+    li.append(name);
+    if (iAmOwner && !p.owner) {
+      const kick = document.createElement("button");
+      kick.className = "btn";
+      kick.type = "button";
+      kick.textContent = "追放";
+      kick.addEventListener("click", () => {
+        if (confirm(`${p.name} をこの部屋から追放しますか？`)) ws?.send(JSON.stringify({ t: "kick", cid: p.cid }));
+      });
+      li.append(kick);
+    }
+    list.append(li);
+  }
+}
+addEventListener("keydown", (e) => {
+  if (e.code !== "Tab" || overlay.style.display !== "none") return;
+  e.preventDefault();
+  const open = playersPanel.style.display !== "block";
+  playersPanel.style.display = open ? "block" : "none";
+  if (open) renderPlayers();
+});
 
 // ===== 入力 =====
 const KEYMAP = {
@@ -587,7 +764,7 @@ function drawHud(me) {
     banner([
       `${MODE_NAME[g.mode]}　待機中　あと ${g.t} 秒で開始（空いた枠は bot が入ります）`,
       g.owner ? "Enter キーで今すぐ開始　／　ウォームアップ中は撃てません" : "部屋主の開始を待っています　／　ウォームアップ中は撃てません",
-      settings ? settingsText(settings) : "",
+      (settings ? settingsText(settings) : "") + (inviteCode ? `　招待コード ${inviteCode}（Tab）` : ""),
     ], false, H - 26); // 自機に重ならないよう画面下に出す
   } else if (g.ph === "countdown") {
     banner([String(g.t)], true);

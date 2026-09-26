@@ -5,8 +5,14 @@
   // public/ 配下を静的ファイルとして配信（/ws 以外はここから返る）
   "assets": { "directory": "./public" },
   "durable_objects": {
-    "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      { "name": "LOBBY", "class_name": "Lobby" }
+    ]
   },
   // 無料プランでは SQLite バックエンドの Durable Object が必要
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["Lobby"] }
+  ]
 }

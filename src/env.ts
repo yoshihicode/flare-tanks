@@ -1,0 +1,7 @@
+// Bindings and variables shared by the Worker, Room and Lobby
+export interface Env {
+  ROOM: DurableObjectNamespace;
+  LOBBY: DurableObjectNamespace;
+  DEBUG_TOOLS?: string; // "1" のときだけデバッグ用コマンドを受け付ける（npm run dev で有効）
+  GUEST_SECRET?: string; // signs guest tokens. Dev: set by npm run dev. Production: wrangler secret put GUEST_SECRET
+}

@@ -22,18 +22,21 @@ let grid = null;
 
 // 参加して最初のスナップショットを受け取るまで待つ（順番に参加させてチームを A・B・A に固定する）
 // c.id は自分が操作している戦車のID（bot の枠を引き継ぐので、スナップショットの me で知る）
-// who: {name, token} to join as a given guest (a fresh guest token is fetched otherwise)
+// who: {name, token} to join as a given guest (a fresh guest token is fetched otherwise).
+// who.lobby: the room was created through the lobby; otherwise it's a dev-only ad-hoc room (adhoc=1)
 async function join(tank, roomName = room, extra = "", who = {}) {
   const name = who.name ?? "tester";
   const token = who.token ?? (await guest(name)).body.token;
   return new Promise((resolve, reject) => {
     const q = new URLSearchParams({ room: roomName, tank, token, name });
+    if (!who.lobby) q.set("adhoc", "1");
     const c = { ws: new WebSocket(`${BASE}?${q}${extra}`), id: null, onSnap: null, token, name };
     c.ws.onerror = () => reject(new Error("接続できません。npm run dev は起動していますか？"));
     c.ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
       if (m.t === "init") { grid ??= makeGrid(m.map); c.init = m; c.settings = m.settings; }
       else if (m.t === "cfg") { c.settings = m.settings; c.points = m.points; }
+      else if (m.t === "players") c.players = m.players;
       else if (m.t === "s") {
         c.id = m.me; // 観戦中は null
         c.last = m;
@@ -294,6 +297,82 @@ const settingsDone = (async () => {
   sstep("フレンドリーファイアなしなら味方に当たらない", off.lost === 0, `ally lost ${off.lost}hp`);
 })();
 
+// Try to join and report how it ended: "ok" (got a snapshot) or the close code
+async function tryJoin(roomName, who = {}) {
+  const token = who.token ?? (await guest("x")).body.token;
+  const q = new URLSearchParams({ room: roomName, tank: "medium", token, name: who.name ?? "x" });
+  if (who.adhoc) q.set("adhoc", "1");
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`${BASE}?${q}`);
+    ws.onmessage = (e) => { if (JSON.parse(e.data).t === "s") { resolve("ok"); ws.close(); } };
+    ws.onclose = (e) => resolve(e.code);
+    setTimeout(() => resolve("timeout"), 3000);
+  });
+}
+
+// ===== Lobby: room list, create, invite code, quick join, kick, close =====
+const lobbyChecks = [];
+const lstep = (name, ok, detail = "") => lobbyChecks.push([name, ok, detail]);
+const lobbyDone = (async () => {
+  const token = (await guest("lobbyist")).body.token;
+  const api = async (path, body) => {
+    const r = await fetch(`${HTTP}${path}`, { method: "POST", body: JSON.stringify({ token, ...body }) });
+    return { status: r.status, body: await r.json() };
+  };
+  const lists = [];
+  const watcher = new WebSocket(`${HTTP.replace(/^http/, "ws")}/lobby?token=${encodeURIComponent(token)}`);
+  watcher.onmessage = (e) => lists.push(JSON.parse(e.data));
+  lstep("ロビー：接続すると部屋一覧が届く", await until(() => lists[0]?.t === "rooms" && Array.isArray(lists[0].rooms)));
+  const listed = (id) => lists.at(-1)?.rooms.find((r) => r.id === id);
+
+  const unauth = await fetch(`${HTTP}/api/rooms`, { method: "POST", body: JSON.stringify({ token: "bad" }) });
+  lstep("トークンなしでは部屋を作れない", unauth.status === 401, `status=${unauth.status}`);
+  const pub = (await api("/api/rooms", { settings: { mode: "conquest", botLevel: 2, public: true } })).body;
+  lstep("公開部屋を作ると一覧に配信される", await until(() => listed(pub.id)?.mode === "conquest" && listed(pub.id)?.humans === 0),
+    JSON.stringify(listed(pub.id)));
+  const priv = (await api("/api/rooms", { settings: { public: false, ff: true } })).body;
+  await sleep(300);
+  lstep("非公開部屋は一覧に出ない（6桁の招待コードが付く）", /^\d{6}$/.test(priv.code) && !listed(priv.id), `code=${priv.code}`);
+  const byCode = await api("/api/code", { code: priv.code });
+  const badCode = await api("/api/code", { code: "12ab" });
+  lstep("招待コードで非公開部屋が見つかる（不正なコードは400）", byCode.body.id === priv.id && badCode.status === 400);
+
+  const p = await join("medium", pub.id, "", { name: "Owner", lobby: true });
+  lstep("ロビーで作った部屋に入ると設定と招待コードが届く",
+    p.settings.mode === "conquest" && p.settings.botLevel === 2 && p.init.code === pub.code, JSON.stringify(p.settings));
+  lstep("入ると一覧の人数が増える", await until(() => listed(pub.id)?.humans === 1), JSON.stringify(listed(pub.id)));
+  lstep("ロビーを通さない部屋には入れない（本番の動作）", (await tryJoin(`nope-${Date.now()}`)) === 4404);
+  const pv = await join("medium", priv.id, "", { lobby: true });
+  lstep("非公開部屋にも入れる（設定が反映）", pv.settings.ff === true && pv.settings.public === false);
+
+  const quick = (await api("/api/quick", {})).body;
+  const qc = await join("medium", quick.id, "", { lobby: true });
+  lstep("クイック参加は空きのある公開部屋に入る", !!quick.id && qc.settings.public === true, `room=${quick.id}`);
+  qc.ws.close();
+
+  const g = await join("medium", pub.id, "", { name: "Guest", lobby: true });
+  await until(() => p.players?.length === 2);
+  const target = p.players?.find((x) => x.name === "Guest");
+  lstep("参加者一覧が届く（部屋主に印）", p.players?.find((x) => x.name === "Owner")?.owner === true && target && !target.owner,
+    JSON.stringify(p.players));
+  g.ws.send(JSON.stringify({ t: "kick", cid: p.players.find((x) => x.name === "Owner").cid }));
+  await sleep(300);
+  lstep("部屋主以外は追放できない", p.ws.readyState === 1);
+  const kicked = new Promise((resolve) => { g.ws.onclose = (e) => resolve(e.code); });
+  p.ws.send(JSON.stringify({ t: "kick", cid: target.cid }));
+  lstep("部屋主は追放できる", (await Promise.race([kicked, sleep(2000)])) === 4005);
+  lstep("追放された人は入り直せない", (await tryJoin(pub.id, { token: g.token, name: "Guest" })) === 4005);
+
+  await startNow(p);
+  lstep("対戦中は一覧で「対戦中」になる", await until(() => listed(pub.id)?.playing === true));
+  debug(p, { closeWhenEmpty: true });
+  p.ws.close();
+  lstep("全員が抜けた部屋は一覧から消える", await until(() => lists.length && !listed(pub.id), 4000));
+  lstep("閉じた部屋の古いリンクでは入れない", (await tryJoin(pub.id)) === 4404);
+  pv.ws.close();
+  watcher.close();
+})();
+
 // ===== Guest identity: offline checks of src/guest.ts, then the API and a room =====
 const guestChecks = [];
 const gstep = (name, ok, detail = "") => guestChecks.push([name, ok, detail]);
@@ -320,7 +399,7 @@ const guestDone = (async () => {
       && forged.body.gid !== first.body.gid, `bad=${bad.status} gid kept=${again.body.gid === first.body.gid}`);
 
   const noToken = await new Promise((resolve) => {
-    const ws = new WebSocket(`${BASE}?room=${room}-guest&tank=medium&name=x`);
+    const ws = new WebSocket(`${BASE}?room=${room}-guest&tank=medium&name=x&adhoc=1`);
     ws.onmessage = () => resolve(false);
     ws.onerror = ws.onclose = () => resolve(true);
     setTimeout(() => resolve(false), 3000);
@@ -507,6 +586,7 @@ setTimeout(async () => {
   await botCaptureDone;
   await settingsDone;
   await guestDone;
+  await lobbyDone;
   const checks = [
     ["スナップショット受信 >100", snaps > 100, `snapshots=${snaps}`],
     ["発射・被弾・撃破イベント", ["fire", "hit", "kill"].every((k) => events.has(k)), `events=${[...events].join(",")}`],
@@ -518,6 +598,7 @@ setTimeout(async () => {
     ...conquest,
     ...setting,
     ...guestChecks,
+    ...lobbyChecks,
     ["拠点制圧：bot が自分で拠点を取る", botCapture.owned !== null, `owned=${botCapture.owned}`],
     ["切断した戦車を bot が引き継ぐ", bots.takenOver && bots.alliesMax === 3, `takenOver=${bots.takenOver}`],
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],

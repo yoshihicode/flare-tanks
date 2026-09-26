@@ -27,9 +27,9 @@ npm install
 npm run dev          # http://localhost:8787 をブラウザのタブ2つで開くと対戦できます
 ```
 
-部屋を分けるには `?room=名前` を付けます（例：`http://localhost:8787/?room=test`）。
-bot の強さは、部屋に最初に入る人が `?bot=1`〜`5` で指定できます（既定は3）。
-拠点制圧モードで遊ぶには、部屋に最初に入る人が `?mode=conquest` を付けます（例：`http://localhost:8787/?room=test&mode=conquest`）。
+名前と戦車を選ぶとロビーに入ります。クイック参加、部屋を作る（モード・先取ラウンド・bot の強さ・フレンドリーファイア・公開／非公開）、招待コードで参加、から選べます。友だちを誘うときは、対戦中に Tab キーで開く参加者一覧から招待URLをコピーします。
+
+開発時だけ、`?room=名前` でロビーを通さずに部屋へ直接入れます（例：`http://localhost:8787/?room=test&mode=conquest&bot=5`）。
 
 ## デプロイ
 ```bash
@@ -46,12 +46,13 @@ npm run deploy
 | `src/index.ts` | Worker（/ws の振り分け）と Room（ゲームループ・判定・配信） |
 | `public/index.html` | タイトル画面とキャンバス |
 | `public/game.js` | 描画・入力・通信・効果音 |
+| `src/lobby-do.ts`・`src/lobby.ts` | ロビー（部屋一覧・作成・クイック参加・招待コード） |
+| `src/guest.ts`・`src/settings.ts` | ゲスト識別（署名トークン・名前）、部屋の設定 |
 | `src/bot.ts` | bot の思考（経路探索・状態遷移・強さ5段階） |
 | `public/ghosts.js` | 見えなくなった敵の残像（クライアントのみ） |
 | `public/shared.js` | サーバーと共有する判定（移動・視界・可視ポリゴン）と戦車3種の性能 |
 | `wrangler.jsonc` | Cloudflare の設定 |
 
 ## 現時点の割り切り（次以降で対応）
-- 部屋の設定（モード・botの強さなど）の画面、名前 → ステップ5
-- ロビー・ゲストトークン・Turnstileなし → ステップ5
+- Turnstile（自動プログラム対策）と部屋作成数の制限 → ステップ5の残り
 - スマホ操作なし → ステップ6

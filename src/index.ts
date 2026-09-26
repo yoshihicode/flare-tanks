@@ -7,6 +7,8 @@ import {
 import { Bot, type Pin } from "./bot.ts";
 import { DEFAULT_SETTINGS, parseSettings, settingsFromQuery, type RoomSettings } from "./settings.ts";
 import { GUEST, checkName, newGuestId, signToken, uniqueName, verifyToken } from "./guest.ts";
+import type { Env } from "./env.ts";
+export { Lobby } from "./lobby-do.ts";
 
 // ===== ゲーム定数（車種ごとの性能は public/shared.js の TANK_TYPES） =====
 const TEAM_SIZE = 3; // 1チームの台数（3vs3）。空いた枠は bot が埋める
@@ -83,11 +85,6 @@ interface GameEvent { e: "fire" | "hit" | "kill" | "wall" | "cap"; x: number; y:
 // Capture point. cap runs from -1 (owned by B) to +1 (owned by A)
 interface CapturePoint { id: string; x: number; y: number; cap: number; owner: Team | null; contested: boolean }
 
-interface Env {
-  ROOM: DurableObjectNamespace;
-  GUEST_SECRET?: string; // signs guest tokens. Dev: set by npm run dev. Production: wrangler secret put GUEST_SECRET
-  DEBUG_TOOLS?: string; // "1" のときだけデバッグ用コマンドを受け付ける（npm run dev で有効）
-}
 
 // ===== マップ（40×24タイル、点対称） =====
 const MAP = buildMap();
@@ -114,6 +111,8 @@ function buildMap(): string[] {
 }
 
 const isWall = (px: number, py: number): boolean => isWallAt(GRID, px, py);
+
+interface RoomSetup { id: string; code: string; settings: unknown }
 
 // Capture point markers are part of the map data (ignored in elimination mode).
 // C sits at the map center; A (team A side) and B are point-symmetric about it
@@ -164,6 +163,26 @@ export default {
       return json({ token: await signToken(secret, gid), gid, name: checked.name });
     }
 
+    const lobby = env.LOBBY.get(env.LOBBY.idFromName("lobby"));
+    const toLobby = (path: string, body?: unknown) =>
+      lobby.fetch(`https://lobby${path}`, body === undefined ? undefined : { method: "POST", body: JSON.stringify(body) });
+
+    // Room list watchers (WebSocket, pushed on change) and room actions. All need a valid guest token
+    if (url.pathname === "/lobby") {
+      if (req.headers.get("Upgrade") !== "websocket") return new Response("WebSocket接続が必要です", { status: 426 });
+      if (!(await verifyToken(secret, url.searchParams.get("token")))) return new Response("ゲストの確認に失敗しました", { status: 401 });
+      return lobby.fetch(req);
+    }
+    if (url.pathname === "/api/rooms" || url.pathname === "/api/quick" || url.pathname === "/api/code") {
+      if (req.method !== "POST") return json({ error: "POSTで送ってください" }, 405);
+      const m: any = await req.json().catch(() => null);
+      if (!(await verifyToken(secret, m?.token))) return json({ error: "ゲストの確認に失敗しました" }, 401);
+      if (url.pathname === "/api/rooms") return toLobby("/create", { settings: m.settings });
+      if (url.pathname === "/api/quick") return toLobby("/quick", {});
+      if (!/^\d{6}$/.test(String(m.code))) return json({ error: "招待コードは6桁の数字です" }, 400);
+      return lobby.fetch(`https://lobby/code?code=${m.code}`);
+    }
+
     if (url.pathname === "/ws") {
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("WebSocket接続が必要です", { status: 426 });
@@ -196,10 +215,13 @@ export class Room extends DurableObject<Env> {
   score: Record<Team, number> = { A: 0, B: 0 };
   lastTickAt = 0; // wall-clock time of the previous tick (s)
   reserved = new Map<string, { tankId: string; until: number }>(); // guest ID -> tank held after a disconnect
+  setup: RoomSetup | null = null; // from the lobby: room id, invite code, settings (null for dev ad-hoc rooms)
+  banned = new Set<string>(); // guest IDs kicked by the owner
+  reportedPhase = "";
   emptySince = 0; // when the last human left
   pins: Record<Team, Pin[]> = { A: [], B: [] };
   nextPinId = 1;
-  debug = { freezeBots: false };
+  debug = { freezeBots: false, closeWhenEmpty: false };
   // 試合の進行
   phase: Phase = "wait";
   phaseEndsAt = 0; // いまの段階が終わる時刻（秒）
@@ -210,17 +232,33 @@ export class Room extends DurableObject<Env> {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
+    // From the lobby only (the Worker forwards nothing but /ws here): settings for a new room
+    if (url.pathname === "/setup" && req.method === "POST") {
+      this.setup = await req.json();
+      await this.ctx.storage.put("setup", this.setup);
+      return new Response("ok");
+    }
     const gid = req.headers.get("X-Guest-Id");
     const baseName = decodeURIComponent(req.headers.get("X-Guest-Name") || "");
     if (!gid || !baseName) return new Response("ゲストの確認に失敗しました", { status: 401 });
-    // 最初の1人が来たときに6枠を bot で用意する（部屋の設定は最初の人の指定を使う）
-    if (!this.tanks.length) this.setupRoom(settingsFromQuery(url.searchParams));
-    const now = Date.now() / 1000;
-    const type = toTankType(url.searchParams.get("tank"));
-
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
+    // Rejections are sent as close codes so the browser can show the reason
+    const reject = (code: number, why: string) => {
+      server.close(code, why);
+      return new Response(null, { status: 101, webSocket: client });
+    };
+
+    // Rooms are created through the lobby. Ad-hoc rooms (?room=name&adhoc=1) exist only in dev for tests
+    this.setup ??= (await this.ctx.storage.get<RoomSetup>("setup")) ?? null;
+    const adhoc = this.env.DEBUG_TOOLS === "1" && url.searchParams.get("adhoc") === "1";
+    if (!this.setup && !adhoc) return reject(4404, "部屋が見つかりません");
+    if (this.banned.has(gid)) return reject(4005, "この部屋からは追放されています");
+    // 最初の1人が来たときに6枠を bot で用意する
+    if (!this.tanks.length) this.setupRoom(this.setup ? parseSettings(this.setup.settings) : settingsFromQuery(url.searchParams));
+    const now = Date.now() / 1000;
+    const type = toTankType(url.searchParams.get("tank"));
 
     // Same guest connecting again (another tab, or a reconnect before the old socket noticed):
     // move the existing player over to the new socket and close the old one
@@ -234,7 +272,7 @@ export class Room extends DurableObject<Env> {
       const held = this.reserved.get(gid);
       const tank = held && held.until > now ? this.tanks.find((t) => t.id === held.tankId && !t.human) : undefined;
       const team = tank ? tank.team : this.pickTeam();
-      if (!team) { server.close(4003, "満員です"); return new Response(null, { status: 101, webSocket: client }); }
+      if (!team) return reject(4003, "満員です");
       const taken = new Set([...this.clients.values()].map((x) => x.name));
       c = { id: crypto.randomUUID().slice(0, 8), ws: server, team, type, gid, name: uniqueName(baseName, taken), tank: null, seq: 0 };
       this.clients.set(c.id, c);
@@ -249,11 +287,18 @@ export class Room extends DurableObject<Env> {
     server.addEventListener("message", (ev) => { if (me.ws === server) this.onMessage(me, ev.data); });
     // Only the socket currently attached to the player counts as leaving
     const leave = () => { if (me.ws === server) this.leave(me); };
-    server.addEventListener("close", leave);
+    server.addEventListener("close", (e) => {
+      leave();
+      // Answer the close handshake, or the browser's onclose waits until it times out
+      try { server.close(e.code === 1005 ? 1000 : e.code, "bye"); } catch { /* already closed */ }
+    });
     server.addEventListener("error", leave);
 
-    server.send(JSON.stringify({ t: "init", id: c.id, name: c.name, tile: TILE, map: MAP, ...this.config() }));
+    server.send(JSON.stringify({
+      t: "init", id: c.id, name: c.name, tile: TILE, map: MAP, code: this.setup?.code ?? null, ...this.config(),
+    }));
     this.startLoop();
+    this.playersChanged();
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -267,7 +312,7 @@ export class Room extends DurableObject<Env> {
 
   setupRoom(settings: RoomSettings) {
     this.settings = settings;
-    this.debug = { freezeBots: false };
+    this.debug = { freezeBots: false, closeWhenEmpty: false };
     this.newMatch(Date.now() / 1000);
     this.bullets = [];
     this.tanks = [];
@@ -341,6 +386,41 @@ export class Room extends DurableObject<Env> {
       this.reserved.set(c.gid, { tankId: c.tank.id, until: now + GUEST.reserveSec });
     }
     if (this.clients.size === 0) this.emptySince = now;
+    this.playersChanged();
+  }
+
+  // Human list for the players panel (owner can kick from it); also tells the lobby our head count
+  playersChanged() {
+    const owner = this.owner;
+    const msg = JSON.stringify({
+      t: "players",
+      players: [...this.clients.values()].map((c) => ({ cid: c.id, name: c.name, team: c.team, owner: c === owner })),
+    });
+    for (const c of this.clients.values()) {
+      try { c.ws.send(msg); } catch { /* closed sockets are handled by the close event */ }
+    }
+    this.report();
+  }
+
+  // Tell the lobby how this room is doing (lobby-created rooms only). Fire and forget
+  report(closed = false) {
+    if (!this.setup) return;
+    this.reportedPhase = this.phase;
+    const lobby = this.env.LOBBY.get(this.env.LOBBY.idFromName("lobby"));
+    const body = { id: this.setup.id, code: this.setup.code, settings: this.settings, humans: this.clients.size, phase: this.phase, closed };
+    this.ctx.waitUntil(lobby.fetch("https://lobby/update", { method: "POST", body: JSON.stringify(body) }).catch(() => {}));
+  }
+
+  // Owner removes a player; they can't come back to this room
+  kick(cid: unknown) {
+    const target = typeof cid === "string" ? this.clients.get(cid) : undefined;
+    if (!target || target === this.owner) return;
+    this.banned.add(target.gid);
+    this.reserved.delete(target.gid);
+    const ws = target.ws;
+    this.leave(target);
+    this.reserved.delete(target.gid); // leave() holds the tank for reconnects; not for a kicked player
+    try { ws.close(4005, "部屋主に追放されました"); } catch { /* already closed */ }
   }
 
   spawn(t: Tank) {
@@ -356,6 +436,10 @@ export class Room extends DurableObject<Env> {
     // The owner may change room settings, but only while waiting (spec: mode is fixed during a match)
     if (m?.t === "settings") {
       if (c === this.owner && this.phase === "wait") this.applySettings(parseSettings(m.settings, this.settings));
+      return;
+    }
+    if (m?.t === "kick") {
+      if (c === this.owner) this.kick(m.cid);
       return;
     }
     // 部屋主は待機中にすぐ開始できる
@@ -382,6 +466,7 @@ export class Room extends DurableObject<Env> {
     const now = Date.now() / 1000;
     if (typeof m.freezeBots === "boolean") this.debug.freezeBots = m.freezeBots;
     if (m.expireReserve === true) this.reserved.clear(); // pretend the reconnect window has passed
+    if (m.closeWhenEmpty === true) this.debug.closeWhenEmpty = true; // skip the reconnect window when the last human leaves
     if (Number.isFinite(m.phaseSec)) this.phaseEndsAt = now + m.phaseSec; // いまの段階の残り時間を変える
     if (m.killTeam === "A" || m.killTeam === "B") {
       for (const t of this.tanks) if (t.team === m.killTeam) { t.hp = 0; t.dead = true; t.respawnAt = now + CONQUEST.respawnSec; }
@@ -409,6 +494,7 @@ export class Room extends DurableObject<Env> {
     for (const c of this.clients.values()) {
       try { c.ws.send(msg); } catch { /* closed sockets are handled by the close event */ }
     }
+    this.report();
   }
 
   // ===== 試合の進行（殲滅モード） =====
@@ -534,7 +620,12 @@ export class Room extends DurableObject<Env> {
     if (!this.timer) this.timer = setInterval(() => this.tick(), TICK_MS);
   }
 
+  // The room is over: tell the lobby and forget the setup, so old links show "not found"
   stopLoop() {
+    this.report(true);
+    if (this.setup) this.ctx.waitUntil(this.ctx.storage.delete("setup"));
+    this.setup = null;
+    this.banned.clear();
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.lastTickAt = 0;
@@ -565,8 +656,9 @@ export class Room extends DurableObject<Env> {
     const realDt = this.lastTickAt ? Math.min(0.25, Math.max(0, now - this.lastTickAt)) : dt;
     this.lastTickAt = now;
     // Nobody came back within the reconnect window: close the room (spec: stop the DO with 0 humans)
-    if (this.clients.size === 0 && now - this.emptySince > GUEST.reserveSec) return this.stopLoop();
+    if (this.clients.size === 0 && (this.debug.closeWhenEmpty || now - this.emptySince > GUEST.reserveSec)) return this.stopLoop();
     this.updatePhase(now);
+    if (this.phase !== this.reportedPhase) this.report(); // phase changes show up in the lobby list
     for (const team of TEAMS) this.pins[team] = this.pins[team].filter((p) => now - p.at < PIN.lifeSec);
     this.thinkBots(now);
 
