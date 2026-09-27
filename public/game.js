@@ -25,7 +25,10 @@ const PALETTE = {
   floorA: "#1b2419", floorB: "#1f2a1c",
   wall: "#6d6a5c", wallTop: "#8f8b78", wallShade: "#4a483e",
   tread: "#1a1a17",
+  headlight: "#fff3c4", // front corners of the hull, so the facing is easy to read
+  rearShade: "rgba(0, 0, 0, 0.4)", // darker back end of the hull
   A: "#5ad1c8", B: "#e8506a",
+  noseA: "#2f8f88", noseB: "#a3334a", // darker front armor, so the hull's front stands out at any angle
   bullet: "#ffe08a", flare: "#ffb347",
   hpBack: "#3a1d1d", hpFore: "#7bd66b",
   fog: "rgba(4, 7, 5, 0.78)", // 視界の外を覆う暗さ
@@ -808,7 +811,8 @@ const SPRITE = {
 function drawTank(k, isMe) {
   const x = Math.round(k.x - cam.x), y = Math.round(k.y - cam.y);
   const sp = SPRITE[k.k] || SPRITE.medium;
-  // 車体 (drawn at its real angle: the hull now turns smoothly like a tank)
+  // 車体 (drawn at its real angle: the hull turns smoothly like a tank). Local +x is the front:
+  // a sloped nose sticking out past the treads, two headlights on the front corners, a dark rear edge
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(k.b);
@@ -816,7 +820,20 @@ function drawTank(k, isMe) {
   ctx.fillRect(-sp.l, -sp.w - 2, sp.l * 2, 3);
   ctx.fillRect(-sp.l, sp.w - 1, sp.l * 2, 3);
   ctx.fillStyle = PALETTE[k.team];
-  ctx.fillRect(-sp.l + 1, -sp.w, sp.l * 2 - 2, sp.w * 2);
+  ctx.fillRect(-sp.l + 1, -sp.w, sp.l * 2 - 3, sp.w * 2);
+  ctx.fillStyle = PALETTE[`nose${k.team}`];
+  ctx.beginPath(); // sloped front armor
+  ctx.moveTo(sp.l - 2, -sp.w);
+  ctx.lineTo(sp.l + 2, -sp.w + 2);
+  ctx.lineTo(sp.l + 2, sp.w - 2);
+  ctx.lineTo(sp.l - 2, sp.w);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = PALETTE.rearShade;
+  ctx.fillRect(-sp.l + 1, -sp.w, 2, sp.w * 2);
+  ctx.fillStyle = PALETTE.headlight;
+  ctx.fillRect(sp.l, -sp.w + 1, 2, 1);
+  ctx.fillRect(sp.l, sp.w - 2, 2, 1);
   ctx.restore();
   // 砲塔
   ctx.save();
