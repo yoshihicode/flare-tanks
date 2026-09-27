@@ -37,7 +37,7 @@ Feel free to use it as a reference for your own Durable Objects projects. The fu
 - 🗺️ Chunk-based generated maps (128×128 tiles, point-symmetric, reproducible from a seed) or a fixed basic map.
 - 🏠 Lobby with a live room list, quick join, private rooms with 6-digit invite codes, and kicking.
 - 🔁 Reconnect within 30 seconds to get your own tank back from the bot that took it over.
-- 📱 Phone support with twin sticks and a light aim assist; installable as a PWA.
+- 📱 Mobile support with twin sticks and a light aim assist; installable as a PWA.
 - 🔊 Retro sound effects synthesized in the browser (jsfxr-style), panned by direction.
 - 🌏 English and Japanese UI.
 
