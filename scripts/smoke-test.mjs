@@ -990,6 +990,8 @@ b.onSnap = (m) => {
   await until(() => events.has("kill"), MAX_MS - MIN_MS);
   await sleep(500); // let the last hit/kill snapshots arrive
   const elapsed = (Date.now() - t0) / 1000;
+  // With tank controls, bots in the Lv5 room may take a while to meet; wait for them if needed
+  await until(() => bots.fires > 0 && bots.botPins > 0, 20000);
   await flowDone;
   await conquestDone;
   await botCaptureDone;
