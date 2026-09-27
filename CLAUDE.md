@@ -20,10 +20,11 @@ Cloudflare Workers 無料プランだけで動く、ブラウザ向けトップ�
 - `src/turnstile.ts`：Turnstile の検証（失敗・通信エラーはすべて不合格）
 - `src/lobby-do.ts`：ロビー用DO（部屋一覧・作成・クイック参加・招待コード。WebSocket Hibernation）。判断のロジックは `src/lobby.ts`（Node から直接テストできる）。`src/env.ts`：バインディングの型
 - `src/maps.ts`：マップのデータ型と標準マップ（40×24）。`src/mapgen.ts`：チャンク組み合わせ型の自動生成（128×128、シード値で再現、仕様書の条件で検証）。`src/chunks.ts`：16×16の部品。どれも Node から直接テストできる
-- `src/bot.ts`：bot の思考（A*・状態遷移・強さ5段階）。Room に依存せず、Node から直接テストできる
+- `src/bot.ts`：bot の思考（A*・戦車の操縦・状態遷移・強さ5段階）。人間と同じ入力（前進／後退・車体の旋回・照準・射撃）を返す。Room に依存せず、Node から直接テストできる
 - `public/`：静的配信。`index.html`（タイトル画面）、`game.js`（描画・入力・通信・効果音）、`ghosts.js`（見えなくなった敵の残像。クライアントのみ）、`touch.js`（ツインスティック）、`interp.js`（補間バッファ）、`minimap.js`（ミニマップ）、`sfx.js`（効果音の生成と設定値）、`i18n.js`（英語・日本語の辞書。画面の文字は必ずここに置き、両言語に同じキーを入れる）。どれも Node から直接テストできる
 - `public/manifest.json`・`public/sw.js`・`public/icons/`：PWA。アイコンは `node scripts/make-icons.mjs` で生成する（依存なし、生成物はコミットする）。`sw.js` の保存対象（SHELL）は、クライアントのファイルを増やしたら追加する
-- `public/shared.js`：サーバーとクライアントで共有する判定（壁・移動・砲塔旋回・見通し線・視界・可視ポリゴン）と戦車3種の性能（`TANK_TYPES`）。サーバーは `import` してバンドルする
+- `public/shared.js`：サーバーとクライアントで共有する判定（壁・戦車の操縦・砲塔旋回・見通し線・視界・可視ポリゴン）と戦車3種の性能（`TANK_TYPES`）。サーバーは `import` してバンドルする
+  - 移動は戦車の操縦：入力は `drive`（1 前進／-1 後退）と `turn`（1 右旋回／-1 左旋回）。`stepTank` がサーバー・自機の予測・テストで共通。行きたい方向への操縦（`steerToward`）は bot とスマホの左スティックで共通
 - ビルドツールなし。クライアントは素のJavaScript、サーバーはTypeScript（wranglerがバンドル）
 
 ## 設計の原則（変更前に必ず守る）

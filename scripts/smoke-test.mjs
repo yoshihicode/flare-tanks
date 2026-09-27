@@ -4,6 +4,7 @@
 // 使い方：別ターミナルで `npm run dev` を起動してから `npm run test:smoke`
 import {
   makeGrid, stepTank, canSeePoint, canSeeTank, lineOfSight, visibilityPolygon, isWall, angleDiff, tankSpec, TICK_MS, TILE,
+  steerToward,
 } from "../public/shared.js";
 import { botChecks } from "./bot-checks.mjs";
 import { updateGhosts, GHOST } from "../public/ghosts.js";
@@ -83,12 +84,21 @@ async function startNow(owner) {
   const playing = await until(() => owner.last.g.ph === "play", 2000);
   return `${counted ? "countdown" : "no-countdown"}/${playing ? "play" : owner.last.g.ph}`;
 }
-// 入力には確認番号 q を付ける（クライアントの予測補正と同じ形式）
+// 入力には確認番号 q を付ける（クライアントの予測補正と同じ形式）。
+// Like the real client, each message carries the whole input: this call's fields over the previous ones
 const send = (c, m) => {
   if (c.ws.readyState !== 1) return;
+  const before = c.input ?? { drive: 0, turn: 0, aim: 0, fire: false };
+  c.input = { ...before, ...m };
+  if (c.input.drive !== before.drive || c.input.turn !== before.turn) c.moveAt = Date.now(); // for the move check
   c.q = (c.q || 0) + 1;
   c.sentAt = { ...c.sentAt, [c.q]: Date.now() };
-  c.ws.send(JSON.stringify({ t: "in", q: c.q, aim: 0, fire: false, ...m }));
+  c.ws.send(JSON.stringify({ t: "in", q: c.q, ...c.input }));
+};
+// Tank controls: turn the hull toward a heading and drive there (the same steering bots and the touch stick use)
+const steer = (c, me, heading) => {
+  const next = steerToward(me.b, heading);
+  if (next.drive !== c.input?.drive || next.turn !== c.input?.turn) send(c, next);
 };
 const view = (k) => ({ x: k.x, y: k.y, aim: k.a, type: k.k });
 
@@ -140,12 +150,12 @@ const flowDone = (async () => {
   p.ws.send(JSON.stringify({ t: "start" }));
   await until(() => g().ph === "countdown");
   const x0 = p.last.tanks.find((k) => k.id === p.id).x;
-  send(p, { mx: 1, my: 0 });
+  send(p, { drive: 1, turn: 1 });
   await sleep(500);
   const x1 = p.last.tanks.find((k) => k.id === p.id).x;
   step("カウントダウン中は動けない", g().ph === "countdown" && x0 === x1, `x=${x0}→${x1}`);
   step("カウントダウン後に対戦が始まる", await until(() => g().ph === "play", 4000), `ph=${g().ph} t=${g().t}`);
-  send(p, { mx: 0, my: 0 });
+  send(p, { drive: 0, turn: 0 });
 
   const r = await join("light", room3); // 対戦中に参加 → 観戦
   const rView = r.last.tanks.find((k) => k.id === r.last.view);
@@ -226,13 +236,13 @@ const conquestDone = (async () => {
 
   // Gunfire hints: q looks east, p is 200 px to the west (out of sight) and fires 5 shots northward
   debug(q, { moveX: P.C.x, moveY: P.C.y });
-  send(q, { mx: 0, my: 0, aim: 0 });
+  send(q, { drive: 0, turn: 0, aim: 0 });
   debug(p, { moveX: P.C.x - 200, moveY: P.C.y });
   await sleep(300);
   const hintStart = qEvents.length;
-  send(p, { mx: 0, my: 0, aim: -Math.PI / 2, fire: true });
+  send(p, { drive: 0, turn: 0, aim: -Math.PI / 2, fire: true });
   await sleep(2700);
-  send(p, { mx: 0, my: 0, aim: -Math.PI / 2, fire: false });
+  send(p, { drive: 0, turn: 0, aim: -Math.PI / 2, fire: false });
   await sleep(200);
   const hints = qEvents.slice(hintStart).filter((e) => e.e === "shot");
   const leaked = qEvents.slice(hintStart).filter((e) => e.e === "fire");
@@ -296,9 +306,9 @@ const settingsDone = (async () => {
     debug(r, { moveX: me.x + 40, moveY: me.y });
     await sleep(200);
     const hp0 = p.last.tanks.find((k) => k.id === r.id).hp;
-    send(p, { mx: 0, my: 0, aim: 0, fire: true });
+    send(p, { drive: 0, turn: 0, aim: 0, fire: true });
     await sleep(900);
-    send(p, { mx: 0, my: 0, aim: 0, fire: false });
+    send(p, { drive: 0, turn: 0, aim: 0, fire: false });
     await sleep(300);
     return { lost: hp0 - p.last.tanks.find((k) => k.id === r.id).hp, self: p.last.tanks.find((k) => k.id === p.id).hp };
   };
@@ -476,7 +486,7 @@ const lobbyDone = (async () => {
   debug(counter, { reportUsage: true }); // flush what's been counted so far (this message included)
   await sleep(300);
   const u0 = await usage();
-  for (let i = 0; i < 30; i++) send(counter, { mx: i % 2, my: 0 });
+  for (let i = 0; i < 30; i++) send(counter, { drive: i % 2 });
   debug(counter, { reportUsage: true });
   await sleep(500);
   const u1 = await usage();
@@ -639,13 +649,15 @@ const ghostChecks = (() => {
 const touchChecks = (() => {
   const o = { x: 100, y: 100 };
   const at = (dx, dy) => stickVector(o, { x: o.x + dx, y: o.y + dy });
-  const mv = (dx, dy) => { const m = moveFromStick(at(dx, dy)); return `${m.mx},${m.my}`; };
+  // body 0 = facing east. Stick east: drive; stick south: turn right in place; slightly off: turn while driving
+  const mv = (dx, dy, body = 0) => { const m = moveFromStick(at(dx, dy), body); return `${m.drive},${m.turn}`; };
   const me = { x: 0, y: 0 };
   const enemy = (deg) => ({ x: Math.cos((deg * Math.PI) / 180) * 100, y: Math.sin((deg * Math.PI) / 180) * 100, dead: false });
   const deg = (r) => Math.round((r * 180) / Math.PI);
   return [
-    ["スティック：遊びの範囲は無視し、8方向に丸める（WASD と同じ入力）",
-      mv(5, 5) === "0,0" && mv(50, 0) === "1,0" && mv(-40, -38) === "-1,-1" && mv(10, 50) === "0,1", ""],
+    ["スティック：倒した方向へ車体を回して進む（W/S/A/D と同じ入力。遊びの範囲は無視）",
+      mv(5, 5) === "0,0" && mv(50, 0) === "1,0" && mv(0, 50) === "0,1" && mv(50, 15) === "1,1" && mv(0, -50) === "0,-1"
+        && mv(0, 50, Math.PI / 2) === "1,0", `${mv(50, 0)} ${mv(0, 50)} ${mv(50, 15)}`],
     ["スティック：半径より先は1に丸め、大きく倒すと自動射撃",
       at(500, 0).mag === 1 && aimFromStick(at(STICK.radius, 0)).fire && !aimFromStick(at(STICK.radius * 0.5, 0)).fire
         && !aimFromStick(at(3, 0)).active, ""],
@@ -878,22 +890,26 @@ const st = {
 };
 const ratioOk = (ok, ng, min) => ok > 0 && ok / (ok + ng) >= min;
 
-// A・Bとも上部の通路へ移動 → Bは左へ接近 → Aは見えたら狙って撃つ
-send(a, { mx: 0, my: -1 });
-send(b, { mx: 0, my: -1 });
-send(c, { mx: 0, my: 1 });
-setTimeout(() => send(c, { mx: 0, my: 0 }), 1500);
-setTimeout(() => send(a, { mx: 0, my: -1, aim: 3.14 }), 3500); // 180°振り向かせて旋回の上限を確かめる
+// A・Bとも車体を北へ向けて上部の通路へ → Bは西へ向きを変えて接近 → Aは見えたら狙って撃つ。
+// C drives south for 1.5 s. All of it with tank controls (turn the hull, then drive)
+const UP = -Math.PI / 2, DOWN = Math.PI / 2, WEST = Math.PI;
+let aUp = false, bUp = false, cDone = false;
+setTimeout(() => { cDone = true; send(c, { drive: 0, turn: 0 }); }, 1500);
+setTimeout(() => send(a, { aim: 3.14 }), 3500); // 180°振り向かせて旋回の上限を確かめる
 // Pins: three in quick succession -> only one is accepted (rate limit)
 setTimeout(() => { for (let i = 0; i < 3; i++) a.ws.send(JSON.stringify({ t: "pin", x: 100 + i * 10, y: 100 })); }, 1000);
 const pinIds = new Set();
 let bTurned = false, aPrev = null, cPrev = null;
 
-// サーバーの移動結果が共有の stepTank と一致するか（入力が一定の間だけ比べる）
-function checkMove(prevK, k, mx, my) {
-  const p = { x: prevK.x, y: prevK.y, body: 0, type: prevK.k };
-  stepTank(grid, p, mx, my, TICK_MS / 1000);
-  Math.abs(p.x - k.x) < 0.15 && Math.abs(p.y - k.y) < 0.15 ? st.moveSame++ : st.moveDiff++;
+// サーバーの移動結果（位置と車体の向き）が共有の stepTank と一致するか。
+// Compared only once the client's drive / turn has been unchanged for a while (so the server surely has it)
+function checkMove(prevK, k, c) {
+  if (!prevK || !k || !c.input || Date.now() - (c.moveAt ?? 0) < 250 || (!c.input.drive && !c.input.turn)) return;
+  const p = { x: prevK.x, y: prevK.y, body: prevK.b, type: prevK.k };
+  stepTank(grid, p, c.input.drive, c.input.turn, TICK_MS / 1000);
+  const same = Math.abs(p.x - k.x) < 0.15 && Math.abs(p.y - k.y) < 0.15 && Math.abs(angleDiff(p.body, k.b)) < 0.02;
+  same ? st.moveSame++ : st.moveDiff++;
+  if (c.input.turn) st.turnTicks = (st.turnTicks ?? 0) + 1;
 }
 
 a.onSnap = (m) => {
@@ -911,16 +927,20 @@ a.onSnap = (m) => {
     canSeeTank(grid, view(me), en) ? st.enemyOk++ : st.enemyNg++;
   }
 
-  if (aPrev && el > 500 && el < 3500) checkMove(aPrev, me, 0, -1);
-  if (cPrev && ally && el > 300 && el < 1300) checkMove(cPrev, ally, 0, 1);
+  checkMove(aPrev, me, a);
+  checkMove(cPrev, ally, c);
+  if (!aUp) {
+    if (me.y < 2 * TILE) { aUp = true; send(a, { drive: 0, turn: 0 }); } else steer(a, me, UP);
+  }
+  if (!cDone && ally) steer(c, ally, DOWN);
   if (aPrev) st.turnMax = Math.max(st.turnMax, Math.abs(angleDiff(me.a, aPrev.a)));
   aPrev = me; cPrev = ally;
 
   if (el < 4000) return;
   const target = m.tanks.find((k) => k.id === b.id);
-  if (target) send(a, { mx: 0, my: 0, aim: Math.round(Math.atan2(target.y - me.y, target.x - me.x) * 100) / 100, fire: true });
+  if (target) send(a, { drive: 0, turn: 0, aim: Math.round(Math.atan2(target.y - me.y, target.x - me.x) * 100) / 100, fire: true });
   // After the turret test A faces west; look back east along the corridor where B comes from
-  else if (!aLookedBack) { aLookedBack = true; send(a, { mx: 0, my: 0, aim: 0 }); }
+  else if (!aLookedBack) { aLookedBack = true; send(a, { drive: 0, turn: 0, aim: 0 }); }
 };
 let aLookedBack = false;
 
@@ -955,11 +975,13 @@ b.onSnap = (m) => {
     const toA = own && shooter && Math.atan2(shooter.y - own.y, shooter.x - own.x);
     if (toA === undefined || Math.abs(angleDiff(dir, toA)) > 0.6) st.hurtBad.push(dir);
   }
-  // Turn toward A once B has reached the top corridor (by position, not by time: ticks may run slower under load)
+  // Up to the top corridor, then turn west toward A (by position, not by time: ticks may run slower under load)
   const bSelf = m.tanks.find((k) => k.id === b.id);
-  if (!bTurned && bSelf && !bSelf.dead && bSelf.y < 2 * TILE && Date.now() - t0 > 4000) {
-    bTurned = true;
-    send(b, { mx: -1, my: 0 });
+  if (bSelf && !bSelf.dead) {
+    if (!bUp && bSelf.y < 2 * TILE) bUp = true;
+    if (!bUp) steer(b, bSelf, UP);
+    else if (Date.now() - t0 > 4000) { bTurned = true; steer(b, bSelf, WEST); }
+    else send(b, { drive: 0, turn: 0 });
   }
 };
 
@@ -996,7 +1018,7 @@ b.onSnap = (m) => {
     ["初期HPが車種どおり", st.hpOk > 0 && st.hpNg === 0, `ok=${st.hpOk} ng=${st.hpNg}`],
     ["砲塔の旋回が上限どおり", Math.abs(st.turnMax - tankSpec("medium").turn * (TICK_MS / 1000)) < 0.02,
       `max=${st.turnMax.toFixed(3)}rad/tick`],
-    ["移動が共有コードと一致 ≥95%", st.moveSame > 30 && ratioOk(st.moveSame, st.moveDiff, 0.95), `same=${st.moveSame} diff=${st.moveDiff}`],
+    ["移動（前進・後退・車体の旋回）が共有コードと一致 ≥95%、旋回も含む", (st.turnTicks ?? 0) > 5 && st.moveSame > 30 && ratioOk(st.moveSame, st.moveDiff, 0.95), `same=${st.moveSame} diff=${st.moveDiff}`],
     ["入力の確認番号が返る", st.lastAck === a.q && st.lastAck > 1, `ack=${st.lastAck} sent=${a.q}`],
     ["確認番号の往復 <500ms", st.rtts.length > 0 && Math.max(...st.rtts) < 500, `max=${Math.max(...st.rtts)}ms`],
     ["可視ポリゴンが見通し線と一致 ≥98%", ratioOk(poly.same, poly.diff, 0.98), `same=${poly.same} diff=${poly.diff}`],

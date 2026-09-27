@@ -17,14 +17,16 @@ export const TANK_TYPES = {
     fov: 120 * DEG, // 扇形視界の視野角
     range: 208, // 扇形視界の距離（px、13タイル）
     turn: 360 * DEG, // 砲塔の旋回速度（ラジアン/秒）
+    hullTurn: 200 * DEG, // hull rotation speed (rad/s) for A / D
+    reverse: 0.6, // reverse speed as a fraction of forward speed
   },
   medium: {
     r: 6, speed: 60, hp: 100, fireInterval: 0.6, damage: 25,
-    fov: 90 * DEG, range: 160, turn: 200 * DEG,
+    fov: 90 * DEG, range: 160, turn: 200 * DEG, hullTurn: 130 * DEG, reverse: 0.6,
   },
   heavy: {
     r: 7, speed: 36, hp: 160, fireInterval: 1.2, damage: 50,
-    fov: 60 * DEG, range: 160, turn: 100 * DEG,
+    fov: 60 * DEG, range: 160, turn: 100 * DEG, hullTurn: 75 * DEG, reverse: 0.5,
   },
 };
 export const DEFAULT_TANK = "medium";
@@ -51,16 +53,40 @@ export function hitsWall(g, x, y, r) {
 }
 
 // ===== 移動 =====
-// 戦車を1ステップ動かす（t は {x, y, body, type} を持つオブジェクトで、直接書き換える）。
-// 壁に当たったら軸ごとに止めて、壁沿いに滑らせる
-export function stepTank(g, t, mx, my, dt) {
-  const len = Math.hypot(mx, my);
-  if (len === 0) return;
+// Tank-style driving: drive = 1 forward / -1 reverse / 0, turn = 1 clockwise (D) / -1 counter-clockwise (A) / 0.
+// The hull turns first, then moves along its new heading (so turning while driving curves the path).
+// t is {x, y, body, type} and is modified in place. Walls stop each axis separately, so the tank slides along them
+export function stepTank(g, t, drive, turn, dt) {
   const s = tankSpec(t.type);
-  const dx = (mx / len) * s.speed * dt, dy = (my / len) * s.speed * dt;
+  if (turn) t.body = wrapAngle(t.body + Math.sign(turn) * s.hullTurn * dt);
+  if (!drive) return;
+  const v = (drive > 0 ? s.speed : -s.speed * s.reverse) * dt;
+  const dx = Math.cos(t.body) * v, dy = Math.sin(t.body) * v;
   if (!hitsWall(g, t.x + dx, t.y, s.r)) t.x += dx;
   if (!hitsWall(g, t.x, t.y + dy, s.r)) t.y += dy;
-  t.body = Math.atan2(my, mx);
+}
+
+const wrapAngle = (a) => ((((a + Math.PI) % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2)) - Math.PI;
+
+// Steering toward a direction (used by bots and the touch stick): turn the hull toward `heading`,
+// drive forward once roughly facing it. With allowReverse, a heading behind the tank is reached by
+// backing up instead of turning around
+export const STEER = {
+  dead: 0.15, // rad: close enough, stop turning (one tick of turning is ~0.06-0.17 rad)
+  driveWithin: 0.7, // rad: drive only when the heading is within this of the hull direction
+  reverseBeyond: 2.3, // rad: with allowReverse, a heading further behind than this is reached in reverse
+};
+export function steerToward(body, heading, allowReverse = false) {
+  let diff = angleDiff(heading, body);
+  let forward = 1;
+  if (allowReverse && Math.abs(diff) > STEER.reverseBeyond) {
+    diff = angleDiff(heading + Math.PI, body); // point the rear at it
+    forward = -1;
+  }
+  return {
+    turn: Math.abs(diff) > STEER.dead ? Math.sign(diff) : 0,
+    drive: Math.abs(diff) < STEER.driveWithin ? forward : 0,
+  };
 }
 
 // 砲塔を目標の向きへ、1ステップで最大 turn*dt だけ回した角度を返す

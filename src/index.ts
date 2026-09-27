@@ -62,7 +62,8 @@ const TEAMS: Team[] = ["A", "B"];
 const toTankType = (v: unknown): TankType =>
   typeof v === "string" && v in TANK_TYPES ? (v as TankType) : (DEFAULT_TANK as TankType);
 
-interface Input { mx: number; my: number; aim: number; fire: boolean }
+// drive: 1 forward / -1 reverse, turn: 1 clockwise / -1 counter-clockwise (hull), aim: turret target angle
+interface Input { drive: number; turn: number; aim: number; fire: boolean }
 // 戦車（6枠）。人間が操作していない間は bot が操作する
 interface Tank {
   id: string; team: Team; slot: number; type: TankType;
@@ -99,7 +100,7 @@ interface RoomSetup { id: string; code: string; settings: unknown }
 const dir = (v: unknown) => (v === 1 || v === -1 ? v : 0);
 const r1 = (v: number) => Math.round(v * 10) / 10;
 const r2 = (v: number) => Math.round(v * 100) / 100;
-const IDLE: Input = { mx: 0, my: 0, aim: 0, fire: false };
+const IDLE: Input = { drive: 0, turn: 0, aim: 0, fire: false };
 
 // ===== Worker：/ws を部屋のDurable Objectへ振り分ける =====
 const json = (body: unknown, status = 200) =>
@@ -452,7 +453,7 @@ export class Room extends DurableObject<Env> {
     }
     if (m?.t !== "in" || !c.tank) return;
     c.tank.input = {
-      mx: dir(m.mx), my: dir(m.my),
+      drive: dir(m.drive), turn: dir(m.turn),
       aim: Number.isFinite(m.aim) ? m.aim : c.tank.input.aim,
       fire: m.fire === true,
     };
@@ -717,7 +718,7 @@ export class Room extends DurableObject<Env> {
       // Conquest: destroyed tanks come back at their own base after a delay
       if (t.dead && this.mode === "conquest" && this.phase === "play" && now >= t.respawnAt) this.spawn(t);
       if (t.dead || !canMove) continue;
-      stepTank(this.grid, t, t.input.mx, t.input.my, dt);
+      stepTank(this.grid, t, t.input.drive, t.input.turn, dt);
       // 砲塔は入力の向きへ、車種ごとの旋回速度の上限で回す
       t.aim = turnTurret(t.type, t.aim, t.input.aim, dt);
       t.cooldown = Math.max(0, t.cooldown - dt);

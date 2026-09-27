@@ -12,7 +12,7 @@ import { t, setLang, getLang, detectLang, applyI18n } from "./i18n.js";
   setLang(saved ?? detectLang(navigator.languages ?? [navigator.language]));
   applyI18n(document);
 }
-import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon } from "./shared.js";
+import { TILE, TANK_TYPES, DEFAULT_TANK, NEAR_VIEW, tankSpec, makeGrid, stepTank, turnTurret, visibilityPolygon, angleDiff } from "./shared.js";
 
 // ===== 画面設定：320×180で描画して整数倍に拡大 =====
 const W = 320, H = 180;
@@ -74,6 +74,7 @@ const cam = { x: 0, y: 0 };
 // 入力をすぐ自機に反映し、サーバーの結果で少しずつ補正する
 const PREDICT = {
   snapDist: 24, // これ以上ずれたら補正せず即座に合わせる（復活・大きなずれ）
+  snapAngle: 0.8, // hull angle error (rad) beyond which the prediction is reset
   correct: 0.15, // スナップショット1回ごとに縮めるずれの割合
   historyMs: 1000, // 予測位置の履歴を残す長さ
 };
@@ -521,8 +522,9 @@ addEventListener("keydown", (e) => {
 });
 
 // ===== 入力 =====
+// Tank controls: W / Up forward, S / Down reverse, A / Left turn the hull left, D / Right turn it right
 const KEYMAP = {
-  KeyW: "up", ArrowUp: "up", KeyS: "down", ArrowDown: "down",
+  KeyW: "forward", ArrowUp: "forward", KeyS: "reverse", ArrowDown: "reverse",
   KeyA: "left", ArrowLeft: "left", KeyD: "right", ArrowRight: "right",
 };
 addEventListener("keydown", (e) => {
@@ -622,25 +624,27 @@ const TOUCH_PIN_AHEAD = 100; // px ahead of the turret for a pin with no enemy i
 
 function sendInput(aim) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const { mx, my } = moveInput();
+  const { drive, turn } = moveInput();
   const fire = fireInput();
   // 変化したときだけ、最短50ms間隔で送る（無料枠の節約）
-  const key = `${mx},${my},${Math.round(aim * 40)},${fire}`;
+  const key = `${drive},${turn},${Math.round(aim * 40)},${fire}`;
   const now = performance.now();
   if (key === lastSentKey || now - lastSentAt < 50) return;
   seq++;
   sentAt.set(seq, now);
-  ws.send(JSON.stringify({ t: "in", q: seq, mx, my, aim: Math.round(aim * 1000) / 1000, fire }));
+  ws.send(JSON.stringify({ t: "in", q: seq, drive, turn, aim: Math.round(aim * 1000) / 1000, fire }));
   lastSentKey = key;
   lastSentAt = now;
 }
 
+// {drive, turn}: keys, or the left stick (the hull turns toward the stick and drives there)
 function moveInput() {
   const v = touchMode && stickOf("move");
-  if (v && v.mag >= STICK.deadZone) return moveFromStick(v);
+  const body = pred?.body ?? curr?.tanks.find((k) => k.id === myId)?.b ?? 0;
+  if (v && v.mag >= STICK.deadZone) return moveFromStick(v, body);
   return {
-    mx: (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0),
-    my: (keys.has("down") ? 1 : 0) - (keys.has("up") ? 1 : 0),
+    drive: (keys.has("forward") ? 1 : 0) - (keys.has("reverse") ? 1 : 0),
+    turn: (keys.has("right") ? 1 : 0) - (keys.has("left") ? 1 : 0),
   };
 }
 
@@ -691,10 +695,10 @@ function predict(dt) {
   const canMove = curr && (curr.g.ph === "wait" || curr.g.ph === "play");
   if (!me || me.dead || !canMove) { pred = null; history = []; return; }
   if (!pred) pred = { x: me.x, y: me.y, body: me.b, aim: me.a, type: me.k };
-  const { mx, my } = moveInput();
-  stepTank(grid, pred, mx, my, dt);
+  const { drive, turn } = moveInput();
+  stepTank(grid, pred, drive, turn, dt);
   const now = performance.now();
-  history.push({ t: now, x: pred.x, y: pred.y });
+  history.push({ t: now, x: pred.x, y: pred.y, body: pred.body });
   while (history.length && history[0].t < now - PREDICT.historyMs) history.shift();
 }
 
@@ -709,16 +713,17 @@ function reconcile(m) {
   const me = m.tanks.find((k) => k.id === myId);
   if (!pred || !me || me.dead) return;
   const target = now - rtt;
-  const past = history.find((h) => h.t >= target) || { x: pred.x, y: pred.y };
+  const past = history.find((h) => h.t >= target) || { x: pred.x, y: pred.y, body: pred.body };
   const ex = me.x - past.x, ey = me.y - past.y;
-  if (Math.hypot(ex, ey) > PREDICT.snapDist) {
+  const eb = angleDiff(me.b, past.body); // the hull angle drifts too now that it turns over time
+  if (Math.hypot(ex, ey) > PREDICT.snapDist || Math.abs(eb) > PREDICT.snapAngle) {
     pred = { x: me.x, y: me.y, body: me.b, aim: me.a, type: me.k };
     history = [];
     return;
   }
-  const cx = ex * PREDICT.correct, cy = ey * PREDICT.correct;
-  pred.x += cx; pred.y += cy;
-  for (const h of history) { h.x += cx; h.y += cy; }
+  const cx = ex * PREDICT.correct, cy = ey * PREDICT.correct, cb = eb * PREDICT.correct;
+  pred.x += cx; pred.y += cy; pred.body += cb;
+  for (const h of history) { h.x += cx; h.y += cy; h.body += cb; }
 }
 
 // ===== 補間 =====
@@ -773,7 +778,6 @@ function drawMinimap() {
 
 // ===== 描画 =====
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-const snap8 = (a) => Math.round(a / (Math.PI / 4)) * (Math.PI / 4);
 
 function drawMap() {
   const tx0 = Math.floor(cam.x / TILE), ty0 = Math.floor(cam.y / TILE);
@@ -804,10 +808,10 @@ const SPRITE = {
 function drawTank(k, isMe) {
   const x = Math.round(k.x - cam.x), y = Math.round(k.y - cam.y);
   const sp = SPRITE[k.k] || SPRITE.medium;
-  // 車体（8方向にスナップしてドット感を保つ）
+  // 車体 (drawn at its real angle: the hull now turns smoothly like a tank)
   ctx.save();
   ctx.translate(x, y);
-  ctx.rotate(snap8(k.b));
+  ctx.rotate(k.b);
   ctx.fillStyle = PALETTE.tread;
   ctx.fillRect(-sp.l, -sp.w - 2, sp.l * 2, 3);
   ctx.fillRect(-sp.l, sp.w - 1, sp.l * 2, 3);

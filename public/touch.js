@@ -1,3 +1,5 @@
+import { steerToward } from "./shared.js";
+
 // Twin-stick touch controls (spec "操作（PC／スマホ）"): left stick moves, right stick aims and
 // fires when pushed far enough. Pure functions, so the smoke test can check them in Node.
 
@@ -17,11 +19,11 @@ export function stickVector(origin, point, radius = STICK.radius) {
   return { dx: len ? (dx / len) * mag : 0, dy: len ? (dy / len) * mag : 0, mag, angle: Math.atan2(dy, dx) };
 }
 
-// Left stick -> the same 8-direction input as WASD (the server accepts -1/0/1 per axis)
-export function moveFromStick(v) {
-  if (v.mag < STICK.deadZone) return { mx: 0, my: 0 };
-  const a = Math.round(v.angle / (Math.PI / 4)) * (Math.PI / 4);
-  return { mx: Math.round(Math.cos(a)), my: Math.round(Math.sin(a)) };
+// Left stick -> the same {drive, turn} input as W / S / A / D: the hull turns toward the stick direction
+// and drives once it roughly faces it (steerToward in shared.js, also used by bots)
+export function moveFromStick(v, body) {
+  if (v.mag < STICK.deadZone) return { drive: 0, turn: 0 };
+  return steerToward(body, v.angle);
 }
 
 // Right stick -> aim angle (only when pushed past the dead zone) and auto-fire

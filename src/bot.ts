@@ -2,14 +2,15 @@
 // 受け取る情報は「自分の状態・味方の状態・自分の視界に入っている敵・自分が撃たれた方向」だけにして、
 // どのレベルでも壁越しに敵を知ることがないようにする（レベル5の連携も、味方が立てたピン＝誰かが見た情報だけ）。
 // Room に依存しないので、Node から直接読み込んでテストできる（スモークテストの前半）
-import { TILE, isWallTile, angleDiff, lineOfSight, tankSpec } from "../public/shared.js";
+import { TILE, isWallTile, angleDiff, lineOfSight, tankSpec, steerToward } from "../public/shared.js";
 
 export interface TankView {
   id: string; team: string; type: string;
-  x: number; y: number; aim: number; hp: number; dead: boolean;
+  x: number; y: number; body: number; aim: number; hp: number; dead: boolean;
 }
 // pin: place an "enemy spotted" marker for the team (same input format as humans)
-export interface BotInput { mx: number; my: number; aim: number; fire: boolean; pin?: { x: number; y: number } }
+// Same input as humans: drive (1 / -1 / 0) and turn (1 / -1 / 0) for the hull, aim for the turret
+export interface BotInput { drive: number; turn: number; aim: number; fire: boolean; pin?: { x: number; y: number } }
 // An ally's "enemy spotted" marker (placed by a human or a bot on the same team)
 export interface Pin { id: number; x: number; y: number; at: number; by: string }
 export interface Perception {
@@ -44,7 +45,8 @@ export const BOT_LEVELS = {
 export type BotLevel = keyof typeof BOT_LEVELS;
 
 const BOT = {
-  arriveDist: 3, // 経路上の点に着いたとみなす距離（px）
+  arriveDist: 6, // 経路上の点に着いたとみなす距離（px）
+  lookahead: 8, // path points ahead considered for a straight-line shortcut (tank controls: fewer stops to turn)
   stuckSec: 1.2, // この時間ほとんど動けなければ経路を引き直す
   lookSweep: 0.9, // 巡回中に周囲を見回す振れ幅（ラジアン）
   lookSpeed: 1.6, // 見回す速さ
@@ -138,6 +140,9 @@ const center = (t: Tile) => ({ x: t[0] * TILE + TILE / 2, y: t[1] * TILE + TILE 
 const sameTile = (a: Tile, b: Tile) => a[0] === b[0] && a[1] === b[1];
 
 type State = "patrol" | "ambush" | "engage" | "chase" | "retreat" | "objective";
+// Where a plan wants to go: a direction (not normalized; 0,0 = stay) and whether backing up is fine
+interface Move { dx: number; dy: number; reverse?: boolean }
+const STOP: Move = { dx: 0, dy: 0 };
 interface Memory { id: string; x: number; y: number; vx: number; vy: number; seenAt: number }
 
 // ===== bot 本体 =====
@@ -190,7 +195,7 @@ export class Bot {
     else if (this.state === "ambush" && p.now < this.ambushUntil) this.state = "ambush";
     else if (this.state !== "patrol") { this.state = "patrol"; this.path = []; }
 
-    let move = { mx: 0, my: 0 };
+    let move: Move = STOP;
     let aim = s.aim;
     let fire = false;
 
@@ -206,7 +211,7 @@ export class Bot {
 
     switch (this.state) {
       case "retreat":
-        move = this.goTo(s, this.opts.home, p.now);
+        move = { ...this.goTo(s, this.opts.home, p.now), reverse: true }; // back off while still facing the threat
         break;
       case "engage":
         move = this.engageMove(s, target!, p.now);
@@ -221,11 +226,11 @@ export class Bot {
         // Go into the zone, then hold there watching toward the enemy base
         const o = point!;
         const inside = Math.hypot(o.x - s.x, o.y - s.y) < o.r * BOT.holdRatio;
-        move = inside ? { mx: 0, my: 0 } : this.goTo(s, o, p.now);
+        move = inside ? STOP : this.goTo(s, o, p.now);
         if (!(p.hit && p.now - p.hit.at < BOT.hitMemorySec)) {
           const toward = inside
             ? Math.atan2(this.opts.enemyHome.y - s.y, this.opts.enemyHome.x - s.x)
-            : move.mx || move.my ? Math.atan2(move.my, move.mx) : s.aim;
+            : move.dx || move.dy ? s.body : s.aim; // while driving, look around the hull's heading
           aim = toward + Math.sin(p.now * BOT.lookSpeed + s.x * 0.01) * BOT.lookSweep * (inside ? 0.8 : 0.5);
         }
         break;
@@ -252,7 +257,7 @@ export class Bot {
         move = this.follow(s);
         if (!target && !(p.hit && p.now - p.hit.at < BOT.hitMemorySec)) {
           // 進む方向を中心に首を振り、扇形視界の死角を減らす
-          const heading = move.mx || move.my ? Math.atan2(move.my, move.mx) : s.aim;
+          const heading = move.dx || move.dy ? s.body : s.aim;
           aim = heading + Math.sin(p.now * BOT.lookSpeed + s.x * 0.01) * BOT.lookSweep;
         }
         break;
@@ -260,7 +265,9 @@ export class Bot {
     }
     const pin = this.pinRequest ?? undefined;
     this.pinRequest = null;
-    return { ...move, aim, fire, pin };
+    // The plans above say which way to go; drive the hull there like a tank
+    const drive = move.dx || move.dy ? steerToward(s.body, Math.atan2(move.dy, move.dx), move.reverse) : { drive: 0, turn: 0 };
+    return { ...drive, aim, fire, pin };
   }
 
   // Conquest: choose the capture point to go to. Re-picked every few seconds so bots don't flip-flop.
@@ -338,13 +345,13 @@ export class Bot {
   engageMove(s: TankView, t: TankView, now: number) {
     const range = tankSpec(s.type).range;
     const dx = t.x - s.x, dy = t.y - s.y, d = Math.hypot(dx, dy) || 1;
-    if (!this.cfg.keepDistance) return d > 40 ? this.goTo(s, t, now) : { mx: 0, my: 0 };
+    if (!this.cfg.keepDistance) return d > 40 ? this.goTo(s, t, now) : STOP;
     if (d > range * 0.7) return this.goTo(s, t, now);
     if (now - this.strafeAt > BOT.strafeSec) { this.strafe = this.rand() < 0.5 ? -1 : 1; this.strafeAt = now; }
     const back = d < range * 0.4 ? -1 : 0; // 近すぎたら下がる
     const vx = (-dy / d) * this.strafe + (dx / d) * back;
     const vy = (dx / d) * this.strafe + (dy / d) * back;
-    return { mx: Math.abs(vx) > 0.38 ? Math.sign(vx) : 0, my: Math.abs(vy) > 0.38 ? Math.sign(vy) : 0 };
+    return { dx: vx, dy: vy, reverse: back < 0 }; // backing away: reverse rather than turn the front away
   }
 
   // True if a live ally is on the segment from s to t (with a small margin), closer than the target
@@ -429,16 +436,28 @@ export class Bot {
   }
 
   // 経路の次の点へ向かう入力（8方向）。着いた点は経路から外す
-  follow(s: TankView): { mx: number; my: number } {
+  // Direction toward the path. Aims at the farthest of the next few path points that can be reached in a
+  // straight line wide enough for the tank, so a tank-controlled hull doesn't stop to turn at every tile
+  follow(s: TankView): Move {
     while (this.path.length) {
       const c = center(this.path[0]);
       if (Math.hypot(c.x - s.x, c.y - s.y) > BOT.arriveDist) break;
       this.path.shift();
     }
-    if (!this.path.length) return { mx: 0, my: 0 };
-    const c = center(this.path[0]);
-    const dx = c.x - s.x, dy = c.y - s.y;
-    return { mx: Math.abs(dx) > 1.5 ? Math.sign(dx) : 0, my: Math.abs(dy) > 1.5 ? Math.sign(dy) : 0 };
+    if (!this.path.length) return STOP;
+    let goal = center(this.path[0]);
+    for (let i = Math.min(this.path.length, BOT.lookahead) - 1; i > 0; i--) {
+      const c = center(this.path[i]);
+      if (this.clearLine(s, c, tankSpec(s.type).r)) { goal = c; break; }
+    }
+    return { dx: goal.x - s.x, dy: goal.y - s.y };
+  }
+
+  // A straight drive from s to c with room for a tank of radius r (the center line and both edges)
+  clearLine(s: TankView, c: { x: number; y: number }, r: number): boolean {
+    const dx = c.x - s.x, dy = c.y - s.y, d = Math.hypot(dx, dy) || 1;
+    const ox = (-dy / d) * r, oy = (dx / d) * r;
+    return [0, 1, -1].every((k) => lineOfSight(this.grid, s.x + ox * k, s.y + oy * k, c.x + ox * k, c.y + oy * k));
   }
 
   isStuck(p: Perception): boolean {

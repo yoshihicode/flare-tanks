@@ -22,7 +22,7 @@ function run(bot, self, { sec, see = () => [], hit = null, onTick = () => {}, al
   for (let i = 0; i < sec / DT; i++) {
     const now = i * DT;
     const input = bot.think({ self, allies, enemies: see(now), hit, now, objectives, pins });
-    stepTank(grid, self, input.mx, input.my, DT);
+    stepTank(grid, self, input.drive, input.turn, DT);
     self.aim = turnTurret(self.type, self.aim, input.aim, DT);
     if (input.fire && firstFire === null) firstFire = now;
     onTick(now, input);
@@ -160,6 +160,29 @@ export function botChecks() {
     const { firstFire } = run(makeBot(3), self, { sec: 3, objectives, see: () => [enemy] });
     checks.push(["拠点制圧：敵が見えたら拠点より交戦を優先", firstFire !== null, `firstFire=${firstFire?.toFixed(2)}s`]);
   }
+  // Tank controls: bots send only drive / turn (-1, 0, 1), never the old move vector
+  {
+    const bot = makeBot(4);
+    const self = tank("b", "A", at(10, 10));
+    const enemy = tank("e", "B", at(14, 10));
+    const bad = [];
+    run(bot, self, { sec: 3, see: (now) => (now < 1.5 ? [enemy] : []), onTick: (_, inp) => {
+      if (![-1, 0, 1].includes(inp.drive) || ![-1, 0, 1].includes(inp.turn) || "mx" in inp || "my" in inp) bad.push(JSON.stringify(inp));
+    } });
+    checks.push(["bot の入力は前進・後退・車体の旋回（人間と同じ形式）", bad.length === 0, bad[0] ?? ""]);
+  }
+  // Retreating with the enemy in front: back away in reverse, keeping the front toward it
+  {
+    const self = tank("b", "A", at(14, 10), { hp: 20, body: 0 }); // facing east, enemy east, home west
+    const enemy = tank("e", "B", at(20, 10));
+    let reversed = 0, turnedAway = false;
+    run(makeBot(3), self, { sec: 1, see: () => [enemy], onTick: (_, inp) => {
+      if (inp.drive === -1) reversed++;
+      if (Math.abs(angleDiff(self.body, 0)) > 0.6) turnedAway = true;
+    } });
+    checks.push(["bot は退避で前面を敵に向けたまま後退する", reversed > 10 && !turnedAway, `reverse ticks=${reversed}`]);
+  }
+
   // Friendly fire on: an ally in the line of fire holds the shot; with it off the bot fires through
   const throughAlly = (ff) => {
     const self = tank("b", "A", at(10, 10));

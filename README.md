@@ -29,7 +29,8 @@ Feel free to use it as a reference for your own Durable Objects projects. The fu
 ## ⚙️ Features
 
 - 🪖 3 vs 3 rooms; empty slots are filled by bots with five difficulty levels.
-- 🚜 Three tank types (light / medium / heavy) with different speed, HP, fire rate, field of view and turret speed.
+- 🚜 Tank-style driving: W / S drive forward and reverse, A / D turn the hull (also while moving), and the turret follows the mouse on its own. Bots drive the same way.
+- 🛞 Three tank types (light / medium / heavy) with different speed, hull and turret turn rates, HP, fire rate and field of view.
 - 🏁 Two modes: **Elimination** (first to 2 rounds, 10 min per round) and **Conquest** (3 capture points, first to 500 pts, 8 min).
 - 🔦 Fan-shaped vision plus a short all-around view; walls cast shadows computed by ray casting.
 - 🕵️ Unseen enemy gunfire arrives only as a rough direction and distance; pins, hit direction marks and last-seen afterimages help the team.
@@ -44,7 +45,8 @@ Feel free to use it as a reference for your own Durable Objects projects. The fu
 
 | Action | PC | Phone |
 | --- | --- | --- |
-| Move | WASD / arrow keys | Drag on the left half of the screen |
+| Drive forward / reverse | W / S (↑ / ↓) | Drag on the left half of the screen: the hull turns toward the drag and drives |
+| Turn the hull | A / D (← / →), also while driving | (same stick) |
 | Aim (turret and view) | Mouse | Drag on the right half of the screen |
 | Fire | Click / Space | Push the right stick far enough |
 | Pin ("enemy spotted") | Q | Pin button |
@@ -95,7 +97,8 @@ Each room Durable Object is the authority for its match: it moves tanks, resolve
 
 ### Design notes
 
-- 🛡️ **Server-authoritative.** Movement, hits, damage and vision are all computed in the room. The client predicts its own tank with the same shared code (`public/shared.js`) and is corrected by the server.
+- 🛡️ **Server-authoritative.** Movement, hits, damage and vision are all computed in the room. The client predicts its own tank (position and hull angle) with the same shared code (`public/shared.js`) and is corrected by the server.
+- 🕹️ **One input format for everyone.** Players, the touch stick and bots all send the same drive / turn / aim / fire input. The touch stick and bots use the same steering function (`steerToward` in `public/shared.js`): turn toward a direction, drive once facing it, and reverse when backing away from an enemy.
 - 🙈 **Hidden information is never sent.** Enemies and bullets outside your view are filtered out of your snapshot; unseen gunfire is reduced to a 16-way direction and a near / mid / far bucket.
 - 💰 **Few incoming messages, many outgoing.** Incoming WebSocket messages count toward the request limit, outgoing ones are free. Clients send input only when it changes (at most every 50 ms); the server sends 20 snapshots per second; bots run inside the room and send no messages.
 - 😴 **Nothing idles in memory.** The lobby hibernates; a room runs its loop only while people are in it (plus a 30-second reconnect window) and then stops.
@@ -114,7 +117,7 @@ flare-tanks/
 │   ├── index.ts            # Worker routes and the Room Durable Object (game loop, vision, modes)
 │   ├── lobby-do.ts         # Lobby Durable Object (room list, create, quick join, invite codes)
 │   ├── lobby.ts            # Lobby rules as pure functions (quick join order, cleanup, limits)
-│   ├── bot.ts              # Bot AI: A* paths, state machine, five levels, objective sharing
+│   ├── bot.ts              # Bot AI: A* paths, tank-style steering, state machine, five levels, objective sharing
 │   ├── maps.ts             # Map type and the basic 40x24 map
 │   ├── mapgen.ts           # Chunk-based 128x128 map generation and validation
 │   ├── chunks.ts           # Hand-made 16x16 map parts
@@ -126,7 +129,7 @@ flare-tanks/
 ├── public/                 # Client, served as static assets (plain JavaScript modules)
 │   ├── index.html          # Title, lobby and settings screens
 │   ├── game.js             # Rendering, input, networking, sound
-│   ├── shared.js           # Code shared with the server: movement, line of sight, vision, tank stats
+│   ├── shared.js           # Code shared with the server: tank driving, steering, line of sight, vision, tank stats
 │   ├── i18n.js             # English / Japanese text
 │   ├── touch.js            # Twin-stick controls
 │   ├── interp.js           # Interpolation buffer for other tanks
@@ -223,7 +226,8 @@ Without `GUEST_SECRET`, `TURNSTILE_SITEKEY` and `TURNSTILE_SECRET`, the Worker r
 
 | What | Where |
 | --- | --- |
-| Tank stats (speed, HP, fire rate, damage, view, turret speed) | `TANK_TYPES` in `public/shared.js` |
+| Tank stats (speed, reverse speed, hull and turret turn rates, HP, fire rate, damage, view) | `TANK_TYPES` in `public/shared.js` |
+| Steering used by bots and the touch stick | `STEER` in `public/shared.js` |
 | Match timing (waiting, countdown, round length) | `MATCH` in `src/index.ts` |
 | Conquest rules (target, capture time, zone size, respawn) | `CONQUEST` in `src/index.ts` |
 | Bot levels (reaction, aim error, tactics) and behavior | `BOT_LEVELS` and `BOT` in `src/bot.ts` |
