@@ -49,7 +49,7 @@ Feel free to use it as a reference for your own Durable Objects projects. The fu
 | Turn the hull | A / D (← / →), also while driving | (same stick) |
 | Aim (turret and view) | Mouse | Drag on the right half of the screen |
 | Fire | Click / Space | Push the right stick far enough |
-| Pin ("enemy spotted") | Q | Pin button |
+| Pin ("enemy spotted") | Q / right click (at the mouse position) | Pin button |
 | Players / invite link | Tab | Players button |
 | Mute | M | Sound button |
 | Start now (room owner, while waiting) | Enter | Start now button |

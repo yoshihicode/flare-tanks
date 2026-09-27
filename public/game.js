@@ -538,10 +538,13 @@ addEventListener("keydown", (e) => {
   }
   if (e.code === "Space") { mouse.down = true; e.preventDefault(); }
   // Q: "enemy spotted" pin at the mouse position, shared with the team
-  if (e.code === "KeyQ" && !e.repeat && ws?.readyState === WebSocket.OPEN && curr?.me) {
-    ws.send(JSON.stringify({ t: "pin", x: Math.round(mouse.x + cam.x), y: Math.round(mouse.y + cam.y) }));
-  }
+  if (e.code === "KeyQ" && !e.repeat) placePinAtMouse();
 });
+// "Enemy spotted" pin at the mouse position, shared with the team (Q or right click)
+function placePinAtMouse() {
+  if (ws?.readyState !== WebSocket.OPEN || !curr?.me) return;
+  ws.send(JSON.stringify({ t: "pin", x: Math.round(mouse.x + cam.x), y: Math.round(mouse.y + cam.y) }));
+}
 addEventListener("keyup", (e) => {
   if (KEYMAP[e.code]) keys.delete(KEYMAP[e.code]);
   if (e.code === "Space") mouse.down = false;
@@ -551,7 +554,10 @@ addEventListener("mousemove", (e) => {
   mouse.x = ((e.clientX - r.left) * W) / r.width;
   mouse.y = ((e.clientY - r.top) * H) / r.height;
 });
-addEventListener("mousedown", (e) => { if (e.button === 0 && ws) mouse.down = true; });
+addEventListener("mousedown", (e) => {
+  if (e.button === 0 && ws) mouse.down = true;
+  if (e.button === 2 && e.target === cv) placePinAtMouse(); // right click on the game screen (not on panels)
+});
 addEventListener("mouseup", (e) => { if (e.button === 0) mouse.down = false; });
 addEventListener("contextmenu", (e) => e.preventDefault());
 addEventListener("blur", () => { keys.clear(); mouse.down = false; });
