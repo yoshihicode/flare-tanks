@@ -530,7 +530,10 @@ const KEYMAP = {
   KeyW: "forward", ArrowUp: "forward", KeyS: "reverse", ArrowDown: "reverse",
   KeyA: "left", ArrowLeft: "left", KeyD: "right", ArrowRight: "right",
 };
+// Typing in a text field (name, invite code, seed) or using a dropdown: keys belong to that control
+const typing = (e) => !!e.target.closest?.("input, textarea, select, [contenteditable]");
 addEventListener("keydown", (e) => {
+  if (typing(e)) return;
   if (KEYMAP[e.code]) { keys.add(KEYMAP[e.code]); e.preventDefault(); }
   // 部屋主は待機中に Enter ですぐ開始できる
   if (e.code === "Enter" && overlay.style.display === "none" && curr && curr.g.ph === "wait" && curr.g.owner) {
@@ -1184,7 +1187,7 @@ function setMuted(on) {
   if (masterGain) masterGain.gain.value = on ? 0 : SOUND.master;
   touchBar.querySelector("[data-act=sound]").textContent = t(on ? "touch.soundOff" : "touch.soundOn");
 }
-addEventListener("keydown", (e) => { if (e.code === "KeyM" && inGame()) setMuted(!muted); });
+addEventListener("keydown", (e) => { if (e.code === "KeyM" && inGame() && !typing(e)) setMuted(!muted); });
 setMuted(muted); // show the saved setting on the button
 
 // Play an effect at a volume (0..1), panned left (-1) .. right (+1) where supported
